@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width">
+<meta name="theme-color" content="#222"><meta name="generator" content="Hexo 7.1.1">
+
+  <link rel="apple-touch-icon" sizes="180x180" href="/images/apple-touch-icon-next.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon-32x32-next.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/images/favicon-16x16-next.png">
+  <link rel="mask-icon" href="/images/logo.svg" color="#222">
+
+<link rel="stylesheet" href="/css/main.css">
+
+<link rel="stylesheet" href="https://fonts.loli.net/css?family=Noto+Serif+SC:300,300italic,400,400italic,700,700italic&display=swap&subset=latin,latin-ext">
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha256-wiz7ZSCn/btzhjKDQBms9Hx4sSeUYsDrTLg7roPstac=" crossorigin="anonymous">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/3.1.1/animate.min.css" integrity="sha256-PR7ttpcvz8qrF57fur/yAx1qXMFJeJFiA6pSzWi0OIE=" crossorigin="anonymous">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/pace/1.2.4/themes/blue/pace-theme-minimal.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pace/1.2.4/pace.min.js" integrity="sha256-gqd7YTjg/BtfqWSwsJOvndl0Bxc8gFImLEkXQT8+qj0=" crossorigin="anonymous"></script>
+
+<script class="next-config" data-name="main" type="application/json">{"hostname":"www.fixcod.cn","root":"/","images":"/images","scheme":"Pisces","darkmode":false,"version":"8.19.2","exturl":false,"sidebar":{"position":"left","width":280,"display":"post","padding":18,"offset":12},"copycode":{"enable":true,"style":"default"},"fold":{"enable":true,"height":500},"bookmark":{"enable":true,"color":"#222","save":"auto"},"mediumzoom":true,"lazyload":false,"pangu":true,"comments":{"style":"tabs","active":null,"storage":true,"lazyload":false,"nav":null},"stickytabs":false,"motion":{"enable":true,"async":false,"transition":{"menu_item":"fadeInDown","post_block":"fadeIn","post_header":"fadeInDown","post_body":"fadeInDown","coll_header":"fadeInLeft","sidebar":"fadeInUp"}},"i18n":{"placeholder":"搜索...","empty":"没有找到任何搜索结果：${query}","hits_time":"找到 ${hits} 个搜索结果（用时 ${time} 毫秒）","hits":"找到 ${hits} 个搜索结果"},"path":"/search.xml","localsearch":{"enable":true,"trigger":"auto","top_n_per_article":1,"unescape":false,"preload":false}}</script><script src="/js/config.js"></script>
+
+    <meta name="description" content="该文章主要记录本人在分析Unlua源代码所作的一些笔记，里面包含一些用到的lua语法的说明，以及动态绑定和静态绑定，并且还分析了C++和lua的互调流程。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Unlua代码分析">
+<meta property="og:url" content="http://www.fixcod.cn/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/index.html">
+<meta property="og:site_name" content="FixCode Blog">
+<meta property="og:description" content="该文章主要记录本人在分析Unlua源代码所作的一些笔记，里面包含一些用到的lua语法的说明，以及动态绑定和静态绑定，并且还分析了C++和lua的互调流程。">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="http://www.fixcod.cn/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/image.png">
+<meta property="og:image" content="http://www.fixcod.cn/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/image.png">
+<meta property="og:image" content="http://www.fixcod.cn/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/image3.png">
+<meta property="og:image" content="http://www.fixcod.cn/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/image-1.png">
+<meta property="og:image" content="http://www.fixcod.cn/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/image-2.png">
+<meta property="article:published_time" content="2024-04-14T13:56:36.000Z">
+<meta property="article:modified_time" content="2024-11-09T00:20:39.604Z">
+<meta property="article:author" content="FixCode">
+<meta property="article:tag" content="Unlua">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="http://www.fixcod.cn/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/image.png">
+
+
+<link rel="canonical" href="http://www.fixcod.cn/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/">
+
+
+
+<script class="next-config" data-name="page" type="application/json">{"sidebar":"","isHome":false,"isPost":true,"lang":"zh-CN","comments":true,"permalink":"http://www.fixcod.cn/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/","path":"2024/04/14/Unlua代码分析/","title":"Unlua代码分析"}</script>
+
+<script class="next-config" data-name="calendar" type="application/json">""</script>
+<title>Unlua代码分析 | FixCode Blog</title>
+  
+
+
+
+
+
+
+
+
+  <noscript>
+    <link rel="stylesheet" href="/css/noscript.css">
+  </noscript>
+<style>.darkmode--activated{--body-bg-color:#282828;--content-bg-color:#333;--card-bg-color:#555;--text-color:#ccc;--blockquote-color:#bbb;--link-color:#ccc;--link-hover-color:#eee;--brand-color:#ddd;--brand-hover-color:#ddd;--table-row-odd-bg-color:#282828;--table-row-hover-bg-color:#363636;--menu-item-bg-color:#555;--btn-default-bg:#222;--btn-default-color:#ccc;--btn-default-border-color:#555;--btn-default-hover-bg:#666;--btn-default-hover-color:#ccc;--btn-default-hover-border-color:#666;--highlight-background:#282b2e;--highlight-foreground:#a9b7c6;--highlight-gutter-background:#34393d;--highlight-gutter-foreground:#9ca9b6}.darkmode--activated img{opacity:.75}.darkmode--activated img:hover{opacity:.9}.darkmode--activated code{color:#69dbdc;background:0 0}button.darkmode-toggle{z-index:9999}.darkmode-ignore,img{display:flex!important}.beian img{display:inline-block!important}</style></head>
+
+<body itemscope itemtype="http://schema.org/WebPage" class="use-motion">
+  <div class="headband"></div>
+
+  <main class="main">
+    <div class="column">
+      <header class="header" itemscope itemtype="http://schema.org/WPHeader"><div class="site-brand-container">
+  <div class="site-nav-toggle">
+    <div class="toggle" aria-label="切换导航栏" role="button">
+        <span class="toggle-line"></span>
+        <span class="toggle-line"></span>
+        <span class="toggle-line"></span>
+    </div>
+  </div>
+
+  <div class="site-meta">
+
+    <a href="/" class="brand" rel="start">
+      <i class="logo-line"></i>
+      <p class="site-title">FixCode Blog</p>
+      <i class="logo-line"></i>
+    </a>
+  </div>
+
+  <div class="site-nav-right">
+    <div class="toggle popup-trigger" aria-label="搜索" role="button">
+        <i class="fa fa-search fa-fw fa-lg"></i>
+    </div>
+  </div>
+</div>
+
+
+
+<nav class="site-nav">
+  <ul class="main-menu menu"><li class="menu-item menu-item-home"><a href="/" rel="section"><i class="fa fa-home fa-fw"></i>首页</a></li><li class="menu-item menu-item-about"><a href="/about/" rel="section"><i class="fa fa-user fa-fw"></i>关于</a></li><li class="menu-item menu-item-tags"><a href="/tags/" rel="section"><i class="fa fa-tags fa-fw"></i>标签</a></li><li class="menu-item menu-item-categories"><a href="/categories/" rel="section"><i class="fa fa-th fa-fw"></i>分类</a></li><li class="menu-item menu-item-archives"><a href="/archives/" rel="section"><i class="fa fa-archive fa-fw"></i>归档</a></li><li class="menu-item menu-item-notes"><a href="/notes/" rel="section"><i class="fa-solid fa-note-sticky fa-fw"></i>笔记</a></li><li class="menu-item menu-item-application"><a href="/application/" rel="section"><i class="fa-solid fa-blog fa-fw"></i>应用</a></li><li class="menu-item menu-item-announcement"><a href="/announcement/" rel="section"><i class="fa-solid fa-bullhorn fa-fw"></i>网站公告</a></li>
+      <li class="menu-item menu-item-search">
+        <a role="button" class="popup-trigger"><i class="fa fa-search fa-fw"></i>搜索
+        </a>
+      </li>
+  </ul>
+</nav>
+
+
+
+  <div class="search-pop-overlay">
+    <div class="popup search-popup"><div class="search-header">
+  <span class="search-icon">
+    <i class="fa fa-search"></i>
+  </span>
+  <div class="search-input-container">
+    <input autocomplete="off" autocapitalize="off" maxlength="80"
+           placeholder="搜索..." spellcheck="false"
+           type="search" class="search-input">
+  </div>
+  <span class="popup-btn-close" role="button">
+    <i class="fa fa-times-circle"></i>
+  </span>
+</div>
+<div class="search-result-container no-result">
+  <div class="search-result-icon">
+    <i class="fa fa-spinner fa-pulse fa-5x"></i>
+  </div>
+</div>
+
+    </div>
+  </div>
+
+</header>
+        
+  
+  <aside class="sidebar">
+
+    <div class="sidebar-inner sidebar-nav-active sidebar-toc-active">
+      <ul class="sidebar-nav">
+        <li class="sidebar-nav-toc">
+          文章目录
+        </li>
+        <li class="sidebar-nav-overview">
+          站点概览
+        </li>
+      </ul>
+
+      <div class="sidebar-panel-container">
+        <!--noindex-->
+        <div class="post-toc-wrap sidebar-panel">
+            <div class="post-toc animated"><ol class="nav"><li class="nav-item nav-level-1"><a class="nav-link" href="#lua%E8%AF%AD%E6%B3%95"><span class="nav-number">1.</span> <span class="nav-text">lua语法</span></a><ol class="nav-child"><li class="nav-item nav-level-2"><a class="nav-link" href="#%E6%B3%A8%E5%86%8C%E8%A1%A8"><span class="nav-number">1.1.</span> <span class="nav-text">注册表</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#luaL-getmetatable"><span class="nav-number">1.2.</span> <span class="nav-text">luaL_getmetatable</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#luaL-newmetatable"><span class="nav-number">1.3.</span> <span class="nav-text">luaL_newmetatable</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#lua-getmetatable"><span class="nav-number">1.4.</span> <span class="nav-text">lua_getmetatable</span></a></li></ol></li><li class="nav-item nav-level-1"><a class="nav-link" href="#Unlua"><span class="nav-number">2.</span> <span class="nav-text">Unlua</span></a><ol class="nav-child"><li class="nav-item nav-level-2"><a class="nav-link" href="#UObject%E7%9A%84%E6%B3%A8%E5%86%8C%E4%BB%A5%E5%8F%8ALua%E8%A6%86%E5%86%99%E5%87%BD%E6%95%B0%E6%B5%81%E7%A8%8B"><span class="nav-number">2.1.</span> <span class="nav-text">UObject的注册以及Lua覆写函数流程</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#C-%E8%B0%83%E7%94%A8%E8%A2%ABLua%E8%A6%86%E5%86%99%E7%9A%84C-%E6%88%96%E8%80%85%E8%93%9D%E5%9B%BE%E5%87%BD%E6%95%B0"><span class="nav-number">2.2.</span> <span class="nav-text">C++调用被Lua覆写的C++或者蓝图函数</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#Lua%E8%B0%83%E7%94%A8C-UFuncition%E5%87%BD%E6%95%B0%E6%B5%81%E7%A8%8B"><span class="nav-number">2.3.</span> <span class="nav-text">Lua调用C++UFuncition函数流程</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#%E9%9D%99%E6%80%81%E5%88%B0%E5%87%BAC-%E5%88%B0Lua"><span class="nav-number">2.4.</span> <span class="nav-text">静态到出C++到Lua</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#Lua%E8%B0%83%E7%94%A8%E9%9D%99%E6%80%81%E5%AF%BC%E5%87%BA%E7%9A%84%E5%87%BD%E6%95%B0"><span class="nav-number">2.5.</span> <span class="nav-text">Lua调用静态导出的函数</span></a></li></ol></li></ol></div>
+        </div>
+        <!--/noindex-->
+
+        <div class="site-overview-wrap sidebar-panel">
+          <div class="site-author animated" itemprop="author" itemscope itemtype="http://schema.org/Person">
+    <img class="site-author-image" itemprop="image" alt="FixCode"
+      src="/images/avatar.jpg">
+  <p class="site-author-name" itemprop="name">FixCode</p>
+  <div class="site-description" itemprop="description"></div>
+</div>
+<div class="site-state-wrap animated">
+  <nav class="site-state">
+      <div class="site-state-item site-state-posts">
+        <a href="/archives/">
+          <span class="site-state-item-count">2</span>
+          <span class="site-state-item-name">日志</span>
+        </a>
+      </div>
+      <div class="site-state-item site-state-categories">
+          <a href="/categories/">
+        <span class="site-state-item-count">1</span>
+        <span class="site-state-item-name">分类</span></a>
+      </div>
+      <div class="site-state-item site-state-tags">
+          <a href="/tags/">
+        <span class="site-state-item-count">2</span>
+        <span class="site-state-item-name">标签</span></a>
+      </div>
+  </nav>
+</div>
+  <div class="links-of-author animated">
+      <span class="links-of-author-item">
+        <a href="https://github.com/1778750163" title="GitHub → https:&#x2F;&#x2F;github.com&#x2F;1778750163" rel="noopener me" target="_blank"><i class="fab fa-github fa-fw"></i>GitHub</a>
+      </span>
+      <span class="links-of-author-item">
+        <a href="mailto:hi1778750163@gmail.com" title="E-Mail → mailto:hi1778750163@gmail.com" rel="noopener me" target="_blank"><i class="fa fa-envelope fa-fw"></i>E-Mail</a>
+      </span>
+  </div>
+  <div class="cc-license animated" itemprop="license">
+    <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" class="cc-opacity" rel="noopener" target="_blank"><img src="https://cdnjs.cloudflare.com/ajax/libs/creativecommons-vocabulary/2020.11.3/assets/license_badges/small/by_nc_sa.svg" alt="Creative Commons"></a>
+  </div>
+
+        </div>
+      </div>
+        <div class="back-to-top animated" role="button" aria-label="返回顶部">
+          <i class="fa fa-arrow-up"></i>
+          <span>0%</span>
+        </div>
+    </div>
+
+    
+        <div class="pjax">
+        </div>
+  </aside>
+
+
+    </div>
+
+    <div class="main-inner post posts-expand">
+
+
+  
+
+
+<div class="post-block">
+  
+  
+
+  <article itemscope itemtype="http://schema.org/Article" class="post-content" lang="zh-CN">
+    <link itemprop="mainEntityOfPage" href="http://www.fixcod.cn/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/">
+
+    <span hidden itemprop="author" itemscope itemtype="http://schema.org/Person">
+      <meta itemprop="image" content="/images/avatar.jpg">
+      <meta itemprop="name" content="FixCode">
+    </span>
+
+    <span hidden itemprop="publisher" itemscope itemtype="http://schema.org/Organization">
+      <meta itemprop="name" content="FixCode Blog">
+      <meta itemprop="description" content="">
+    </span>
+
+    <span hidden itemprop="post" itemscope itemtype="http://schema.org/CreativeWork">
+      <meta itemprop="name" content="Unlua代码分析 | FixCode Blog">
+      <meta itemprop="description" content="">
+    </span>
+      <header class="post-header">
+        <h1 class="post-title" itemprop="name headline">
+          Unlua代码分析<a href="https://github.com/1778750163/Hexo/edit/main/blog/source/_posts/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90.md" class="post-edit-link" title="编辑" rel="noopener" target="_blank"><i class="fa fa-pen-nib"></i></a>
+        </h1>
+
+        <div class="post-meta-container">
+          <div class="post-meta">
+    <span class="post-meta-item">
+      <span class="post-meta-item-icon">
+        <i class="far fa-calendar"></i>
+      </span>
+      <span class="post-meta-item-text">发表于</span>
+
+      <time title="创建时间：2024-04-14 13:56:36" itemprop="dateCreated datePublished" datetime="2024-04-14T13:56:36+00:00">2024-04-14</time>
+    </span>
+    <span class="post-meta-item">
+      <span class="post-meta-item-icon">
+        <i class="far fa-calendar-check"></i>
+      </span>
+      <span class="post-meta-item-text">更新于</span>
+      <time title="修改时间：2024-11-09 00:20:39" itemprop="dateModified" datetime="2024-11-09T00:20:39+00:00">2024-11-09</time>
+    </span>
+
+  
+    <span class="post-meta-item" title="阅读次数" id="busuanzi_container_page_pv">
+      <span class="post-meta-item-icon">
+        <i class="far fa-eye"></i>
+      </span>
+      <span class="post-meta-item-text">阅读次数：</span>
+      <span id="busuanzi_value_page_pv"></span>
+    </span>
+    <span class="post-meta-break"></span>
+    <span class="post-meta-item" title="本文字数">
+      <span class="post-meta-item-icon">
+        <i class="far fa-file-word"></i>
+      </span>
+      <span class="post-meta-item-text">本文字数：</span>
+      <span>2.6k</span>
+    </span>
+    <span class="post-meta-item" title="阅读时长">
+      <span class="post-meta-item-icon">
+        <i class="far fa-clock"></i>
+      </span>
+      <span class="post-meta-item-text">阅读时长 &asymp;</span>
+      <span>10 分钟</span>
+    </span>
+</div>
+
+        </div>
+      </header>
+
+    
+    
+    
+    <div class="post-body" itemprop="articleBody"><blockquote>
+<p>该文章主要记录本人在分析Unlua源代码所作的一些笔记，里面包含一些用到的lua语法的说明，以及动态绑定和静态绑定，并且还分析了C++和lua的互调流程。</p>
+</blockquote>
+<span id="more"></span>
+
+<h1 id="lua语法"><a href="#lua语法" class="headerlink" title="lua语法"></a>lua语法</h1><h2 id="注册表"><a href="#注册表" class="headerlink" title="注册表"></a>注册表</h2><p>Lua的注册表可以被想象成一个全局的哈希表（或映射），键通常是字符串（如元表的名称）或者是特殊的指针或引用（对于需要唯一键的数据）。在注册表中，每个键都关联一个值，这个值可以是任何Lua支持的类型（如表、函数、用户数据等）。</p>
+<h2 id="luaL-getmetatable"><a href="#luaL-getmetatable" class="headerlink" title="luaL_getmetatable"></a>luaL_getmetatable</h2><p>用于从注册表中检索一个元表。这个函数主要用于获取之前已经注册到 Lua 的全局注册表中的元表，这些元表通常是与特定的用户数据类型或类关联的。</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="title function_">luaL_getmetatable</span>(L, <span class="string">&quot;TSharedPtr&quot;</span>);</span><br></pre></td></tr></table></figure>
+<h2 id="luaL-newmetatable"><a href="#luaL-newmetatable" class="headerlink" title="luaL_newmetatable"></a>luaL_newmetatable</h2><h2 id="lua-getmetatable"><a href="#lua-getmetatable" class="headerlink" title="lua_getmetatable"></a>lua_getmetatable</h2><h1 id="Unlua"><a href="#Unlua" class="headerlink" title="Unlua"></a>Unlua</h1><h2 id="UObject的注册以及Lua覆写函数流程"><a href="#UObject的注册以及Lua覆写函数流程" class="headerlink" title="UObject的注册以及Lua覆写函数流程"></a>UObject的注册以及Lua覆写函数流程</h2><p>UObject注册是从NotifyUObjectCreated这个函数监听Object创建开始的。注册函数bool FLuaEnv::TryBind(UObject* Object) ，判断是不是静态绑定</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">const</span> bool bImplUnluaInterface = <span class="title class_">Class</span>-&gt;<span class="title class_">ImplementsInterface</span>(<span class="title class_">InterfaceClass</span>);</span><br></pre></td></tr></table></figure>
+<p>看看是不是动态绑定，动态绑定的时候会通过</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">static</span> int32 <span class="title class_">UWorld</span>_SpawnActor(lua_State* L)</span><br><span class="line"><span class="keyword">static</span> int32 <span class="title class_">UWorld</span>_SpawnActorEx(lua_State* L)</span><br><span class="line"><span class="keyword">static</span> int32 <span class="title class_">Global</span>_NewObject(lua_State *L)</span><br></pre></td></tr></table></figure>
+<p>上面三个函数将路径信息传递到C++这边，然后通过下面的函数记录到全局变量GLuaDynamicBinding中</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">bValid = <span class="title class_">GLuaDynamicBinding</span>.<span class="title class_">Push</span>(<span class="title class_">Class</span>, <span class="title class_">ModuleName</span>, <span class="title class_">InitializerTableRef</span>);</span><br></pre></td></tr></table></figure>
+<p>因此现在看下面的动态绑定代码就很好理解了</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (!bImplUnluaInterface)</span><br><span class="line">&#123;</span><br><span class="line">    <span class="comment">// dynamic binding</span></span><br><span class="line">    <span class="keyword">if</span> (!<span class="title class_">GLuaDynamicBinding</span>.<span class="title class_">IsValid</span>(<span class="title class_">Class</span>))</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">return</span> <span class="title class_">GetManager</span>()-&gt;<span class="title class_">Bind</span>(<span class="title class_">Object</span>, *<span class="title class_">GLuaDynamicBinding</span>.<span class="property">ModuleName</span>, <span class="title class_">GLuaDynamicBinding</span>.<span class="property">InitializerTableRef</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>接着往下走，动态绑定和静态绑定的绑定函数是一样的都是 GetManager()-&gt;Bind，现在继续分析Bind函数，在绑定UObject的时候会先绑定对应的Class ，首先创建对应的Matetable并进入到Name2Classes</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">const</span> auto L = <span class="title class_">Env</span>-&gt;<span class="title class_">GetMainState</span>();</span><br><span class="line"><span class="keyword">if</span> (!<span class="title class_">PushMetatable</span>(L, <span class="title class_">MetatableName</span>))</span><br><span class="line">    <span class="keyword">return</span> nullptr;</span><br><span class="line"></span><br><span class="line"><span class="comment">// <span class="doctag">TODO:</span> refactor</span></span><br><span class="line"><span class="title function_">lua_pop</span>(L, <span class="number">1</span>);</span><br><span class="line"><span class="title class_">FName</span> <span class="title class_">Key</span> = <span class="title class_">FName</span>(<span class="title class_">UTF8</span>_TO_TCHAR(<span class="title class_">MetatableName</span>));</span><br><span class="line"><span class="keyword">return</span> <span class="title class_">Name2Classes</span>.<span class="title class_">FindChecked</span>(<span class="title class_">Key</span>);</span><br></pre></td></tr></table></figure>
+<p>之后试图去绑定对应的lua文件，然后就是正式的BindClass</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br></pre></td><td class="code"><pre><span class="line">bool <span class="title class_">UUnLuaManager</span>::<span class="title class_">BindClass</span>(<span class="title class_">UClass</span>* <span class="title class_">Class</span>, <span class="keyword">const</span> <span class="title class_">FString</span>&amp; <span class="title class_">InModuleName</span>, <span class="title class_">FString</span>&amp; <span class="title class_">Error</span>)</span><br><span class="line">&#123;</span><br><span class="line">    <span class="title function_">check</span>(<span class="title class_">Class</span>);</span><br><span class="line">    <span class="comment">//.................</span></span><br><span class="line">    auto&amp; <span class="title class_">BindInfo</span> = <span class="title class_">Classes</span>.<span class="title class_">Add</span>(<span class="title class_">Class</span>);</span><br><span class="line">    <span class="title class_">BindInfo</span>.<span class="property">Class</span> = <span class="title class_">Class</span>;</span><br><span class="line">    <span class="title class_">BindInfo</span>.<span class="property">ModuleName</span> = <span class="title class_">InModuleName</span>;</span><br><span class="line">    <span class="title class_">BindInfo</span>.<span class="property">TableRef</span> = <span class="title class_">Ref</span>;</span><br><span class="line"></span><br><span class="line">    <span class="title class_">UnLua</span>::<span class="title class_">LowLevel</span>::<span class="title class_">GetFunctionNames</span>(<span class="title class_">Env</span>-&gt;<span class="title class_">GetMainState</span>(), <span class="title class_">Ref</span>, <span class="title class_">BindInfo</span>.<span class="property">LuaFunctions</span>);<span class="comment">//获取lua中的所有函数名称</span></span><br><span class="line">    <span class="title class_">ULuaFunction</span>::<span class="title class_">GetOverridableFunctions</span>(<span class="title class_">Class</span>, <span class="title class_">BindInfo</span>.<span class="property">UEFunctions</span>);<span class="comment">//获取类里面的反射函数</span></span><br><span class="line"></span><br><span class="line">    <span class="comment">// 用LuaTable里所有的函数来替换Class上对应的UFunction</span></span><br><span class="line">    <span class="keyword">for</span> (<span class="keyword">const</span> auto&amp; <span class="title class_">LuaFuncName</span> : <span class="title class_">BindInfo</span>.<span class="property">LuaFunctions</span>)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="title class_">UFunction</span>** <span class="title class_">Func</span> = <span class="title class_">BindInfo</span>.<span class="property">UEFunctions</span>.<span class="title class_">Find</span>(<span class="title class_">LuaFuncName</span>);</span><br><span class="line">        <span class="keyword">if</span> (<span class="title class_">Func</span>)</span><br><span class="line">        &#123;</span><br><span class="line">            <span class="title class_">UFunction</span>* <span class="title class_">Function</span> = *<span class="title class_">Func</span>;</span><br><span class="line">            <span class="title class_">ULuaFunction</span>::<span class="title class_">Override</span>(<span class="title class_">Function</span>, <span class="title class_">Class</span>, <span class="title class_">LuaFuncName</span>); <span class="comment">//要复写的函数</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">//.................</span></span><br><span class="line">    <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>可以看到覆盖的过程就是遍历lua函数名称，然后看是否能够在反射函数中找到对应的同名函数，找到了就走重写代码 ULuaFunction::Override(Function, Class, LuaFuncName);</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">void</span> <span class="title class_">FLuaOverrides</span>::<span class="title class_">Override</span>(<span class="title class_">UFunction</span>* <span class="title class_">Function</span>, <span class="title class_">UClass</span>* <span class="title class_">Class</span>, <span class="title class_">FName</span> <span class="title class_">NewName</span>)</span><br><span class="line">&#123;</span><br><span class="line">    <span class="keyword">const</span> auto <span class="title class_">OverridesClass</span> = <span class="title class_">GetOrAddOverridesClass</span>(<span class="title class_">Class</span>);</span><br><span class="line"></span><br><span class="line">    <span class="title class_">ULuaFunction</span>* <span class="title class_">LuaFunction</span>;</span><br><span class="line">    <span class="title class_">UObject</span>* <span class="title class_">Outer</span>=<span class="title class_">Function</span>-&gt;<span class="title class_">GetOuter</span>();</span><br><span class="line">    <span class="keyword">const</span> auto bAddNew = <span class="title class_">Outer</span> != <span class="title class_">Class</span>; </span><br><span class="line">    <span class="keyword">if</span> (bAddNew)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">const</span> auto <span class="title class_">Exists</span> = <span class="title class_">Class</span>-&gt;<span class="title class_">FindFunctionByName</span>(<span class="title class_">NewName</span>, <span class="title class_">EIncludeSuperFlag</span>::<span class="title class_">ExcludeSuper</span>);</span><br><span class="line">        <span class="keyword">if</span> (<span class="title class_">Exists</span> &amp;&amp; <span class="title class_">Exists</span>-&gt;<span class="title class_">GetSuperStruct</span>() == <span class="title class_">Function</span>)</span><br><span class="line">            <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">else</span></span><br><span class="line">    &#123;</span><br><span class="line">        <span class="title class_">LuaFunction</span> = <span class="title class_">Cast</span>&lt;<span class="title class_">ULuaFunction</span>&gt;(<span class="title class_">Function</span>); <span class="comment">//已经覆写了就跳过</span></span><br><span class="line">        <span class="keyword">if</span> (<span class="title class_">LuaFunction</span>)</span><br><span class="line">        &#123;</span><br><span class="line">            <span class="title class_">LuaFunction</span>-&gt;<span class="title class_">Initialize</span>();</span><br><span class="line">            <span class="keyword">return</span>;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="title class_">FObjectDuplicationParameters</span> <span class="title class_">DuplicationParams</span>(<span class="title class_">Function</span>, <span class="title class_">OverridesClass</span>);</span><br><span class="line">    <span class="title class_">DuplicationParams</span>.<span class="property">InternalFlagMask</span> &amp;= ~<span class="title class_">EInternalObjectFlags</span>::<span class="title class_">Native</span>;</span><br><span class="line">    <span class="title class_">DuplicationParams</span>.<span class="property">DestName</span> = <span class="title class_">NewName</span>;</span><br><span class="line">    <span class="title class_">DuplicationParams</span>.<span class="property">DestClass</span> = <span class="title class_">ULuaFunction</span>::<span class="title class_">StaticClass</span>();</span><br><span class="line">    <span class="comment">// 拷贝一份Function</span></span><br><span class="line">    <span class="title class_">LuaFunction</span> = static_cast&lt;<span class="title class_">ULuaFunction</span>*&gt;(<span class="title class_">StaticDuplicateObjectEx</span>(<span class="title class_">DuplicationParams</span>));</span><br><span class="line">    <span class="comment">// 加入到OverridesClass的Children 链接中去</span></span><br><span class="line">    <span class="title class_">LuaFunction</span>-&gt;<span class="title class_">Next</span> = <span class="title class_">OverridesClass</span>-&gt;<span class="title class_">Children</span>;</span><br><span class="line">    <span class="title class_">OverridesClass</span>-&gt;<span class="title class_">Children</span> = <span class="title class_">LuaFunction</span>;</span><br><span class="line"></span><br><span class="line">    <span class="title class_">LuaFunction</span>-&gt;<span class="title class_">StaticLink</span>(<span class="literal">true</span>);</span><br><span class="line">    <span class="title class_">LuaFunction</span>-&gt;<span class="title class_">Initialize</span>(); <span class="comment">//一些初始化的操作</span></span><br><span class="line">    <span class="title class_">LuaFunction</span>-&gt;<span class="title class_">Override</span>(<span class="title class_">Function</span>, <span class="title class_">Class</span>, bAddNew); <span class="comment">// 真正的覆写的位置</span></span><br><span class="line">    <span class="title class_">LuaFunction</span>-&gt;<span class="title class_">Bind</span>();</span><br><span class="line">    <span class="comment">//防止GC</span></span><br><span class="line">    <span class="keyword">if</span> (<span class="title class_">Class</span>-&gt;<span class="title class_">IsRooted</span>() || <span class="title class_">GUObjectArray</span>.<span class="title class_">IsDisregardForGC</span>(<span class="title class_">Class</span>))</span><br><span class="line">        <span class="title class_">LuaFunction</span>-&gt;<span class="title class_">AddToRoot</span>(); </span><br><span class="line">    <span class="keyword">else</span></span><br><span class="line">        <span class="title class_">LuaFunction</span>-&gt;<span class="title class_">AddToCluster</span>(<span class="title class_">Class</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>上面的函数需要注意const auto bAddNew &#x3D; Outer !&#x3D; Class; 当重写的函数是蓝图函数的时候bAddNew的值就是false，当重写的函数的C++函数的时候bAddNew就是true，这里主要是判断该重写的函数是否被蓝图重写，这个在下面的步骤会用到。</p>
+<p>接着走到void ULuaFunction::Override(UFunction* Function, UClass* Class, bool bAddNew)</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br></pre></td><td class="code"><pre><span class="line">    <span class="title function_">check</span>(<span class="title class_">Function</span> &amp;&amp; <span class="title class_">Class</span> &amp;&amp; !<span class="title class_">From</span>.<span class="title class_">IsValid</span>());</span><br><span class="line"></span><br><span class="line">#<span class="keyword">if</span> <span class="variable constant_">WITH_METADATA</span></span><br><span class="line">    <span class="title class_">UMetaData</span>::<span class="title class_">CopyMetadata</span>(<span class="title class_">Function</span>, <span class="variable language_">this</span>);</span><br><span class="line">#endif</span><br><span class="line"></span><br><span class="line">    bActivated = <span class="literal">false</span>;</span><br><span class="line">    bAdded = bAddNew;</span><br><span class="line">    <span class="title class_">From</span> = <span class="title class_">Function</span>;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (<span class="title class_">Function</span>-&gt;<span class="title class_">GetNativeFunc</span>() == execScriptCallLua) </span><br><span class="line">    &#123;</span><br><span class="line">        <span class="comment">// 目标UFunction可能已经被覆写过了</span></span><br><span class="line">        <span class="keyword">const</span> auto <span class="title class_">LuaFunction</span> = <span class="title class_">Get</span>(<span class="title class_">Function</span>);</span><br><span class="line">        <span class="title class_">Overridden</span> = <span class="title class_">LuaFunction</span>-&gt;<span class="title class_">GetOverridden</span>();</span><br><span class="line">        <span class="title function_">check</span>(<span class="title class_">Overridden</span>);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">else</span></span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">const</span> auto <span class="title class_">DestName</span> = <span class="title class_">FString</span>::<span class="title class_">Printf</span>(<span class="title function_">TEXT</span>(<span class="string">&quot;%s__Overridden&quot;</span>), *<span class="title class_">Function</span>-&gt;<span class="title class_">GetName</span>());</span><br><span class="line">        <span class="keyword">if</span> (<span class="title class_">Function</span>-&gt;<span class="title class_">HasAnyFunctionFlags</span>(FUNC_Native)) <span class="comment">//判断是不是C++函数，C++函数的则将这个函数加入到类中</span></span><br><span class="line">            <span class="title class_">GetOuterUClass</span>()-&gt;<span class="title class_">AddNativeFunction</span>(*<span class="title class_">DestName</span>, *<span class="title class_">Function</span>-&gt;<span class="title class_">GetNativeFunc</span>());</span><br><span class="line">        <span class="title class_">Overridden</span> = static_cast&lt;<span class="title class_">UFunction</span>*&gt;(<span class="title class_">StaticDuplicateObject</span>(<span class="title class_">Function</span>, <span class="title class_">GetOuter</span>(), *<span class="title class_">DestName</span>));</span><br><span class="line">        <span class="title class_">Overridden</span>-&gt;<span class="title class_">ClearInternalFlags</span>(<span class="title class_">EInternalObjectFlags</span>::<span class="title class_">Native</span>);</span><br><span class="line">        <span class="title class_">Overridden</span>-&gt;<span class="title class_">StaticLink</span>(<span class="literal">true</span>);</span><br><span class="line">        <span class="title class_">Overridden</span>-&gt;<span class="title class_">SetNativeFunc</span>(<span class="title class_">Function</span>-&gt;<span class="title class_">GetNativeFunc</span>());</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="title class_">SetActive</span>(<span class="literal">true</span>);</span><br></pre></td></tr></table></figure>
+<p>然后就是拷贝一份添加__Overridden存储在LuaFunction中的Overridden 变量中，以便恢复，最后的绑定则在SetActive函数里面</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (bAdded)  <span class="comment">//这就用到前面的额值bAddNew，表示C++函数就绑定execCallLua</span></span><br><span class="line">&#123;</span><br><span class="line">    <span class="title function_">check</span>(!<span class="title class_">Class</span>-&gt;<span class="title class_">FindFunctionByName</span>(<span class="title class_">GetFName</span>(), <span class="title class_">EIncludeSuperFlag</span>::<span class="title class_">ExcludeSuper</span>));</span><br><span class="line">    <span class="title class_">SetSuperStruct</span>(<span class="title class_">Function</span>);</span><br><span class="line">    <span class="title class_">FunctionFlags</span> |= FUNC_Native;</span><br><span class="line">    <span class="title class_">ClearInternalFlags</span>(<span class="title class_">EInternalObjectFlags</span>::<span class="title class_">Native</span>);</span><br><span class="line">    <span class="title class_">SetNativeFunc</span>(execCallLua);</span><br><span class="line"></span><br><span class="line">    <span class="title class_">Class</span>-&gt;<span class="title class_">AddFunctionToFunctionMap</span>(<span class="variable language_">this</span>, *<span class="title class_">GetName</span>());</span><br><span class="line">    <span class="keyword">if</span> (<span class="title class_">Function</span>-&gt;<span class="title class_">HasAnyFunctionFlags</span>(FUNC_Native))</span><br><span class="line">        <span class="title class_">Class</span>-&gt;<span class="title class_">AddNativeFunction</span>(*<span class="title class_">GetName</span>(), &amp;<span class="title class_">ULuaFunction</span>::execCallLua);</span><br><span class="line">&#125;</span><br><span class="line"><span class="keyword">else</span></span><br><span class="line">&#123;</span><br><span class="line">    <span class="title class_">SetSuperStruct</span>(<span class="title class_">Function</span>-&gt;<span class="title class_">GetSuperStruct</span>());</span><br><span class="line">    <span class="title class_">Script</span> = <span class="title class_">Function</span>-&gt;<span class="title class_">Script</span>;</span><br><span class="line">    <span class="title class_">Children</span> = <span class="title class_">Function</span>-&gt;<span class="title class_">Children</span>;</span><br><span class="line">    <span class="title class_">ChildProperties</span> = <span class="title class_">Function</span>-&gt;<span class="title class_">ChildProperties</span>;</span><br><span class="line">    <span class="title class_">PropertyLink</span> = <span class="title class_">Function</span>-&gt;<span class="title class_">PropertyLink</span>;</span><br><span class="line"></span><br><span class="line">    <span class="title class_">Function</span>-&gt;<span class="title class_">FunctionFlags</span> |= FUNC_Native;</span><br><span class="line">    <span class="title class_">Function</span>-&gt;<span class="title class_">SetNativeFunc</span>(&amp;execScriptCallLua);</span><br><span class="line">    <span class="title class_">Function</span>-&gt;<span class="title class_">GetOuterUClass</span>()-&gt;<span class="title class_">AddNativeFunction</span>(*<span class="title class_">Function</span>-&gt;<span class="title class_">GetName</span>(), &amp;execScriptCallLua);</span><br><span class="line">    <span class="title class_">Function</span>-&gt;<span class="title class_">Script</span>.<span class="title class_">Empty</span>();</span><br><span class="line">    <span class="title class_">Function</span>-&gt;<span class="title class_">Script</span>.<span class="title class_">AddUninitialized</span>(<span class="title class_">ScriptMagicHeaderSize</span> + <span class="title function_">sizeof</span>(<span class="title class_">ULuaFunction</span>*));</span><br><span class="line">    <span class="keyword">const</span> auto <span class="title class_">Data</span> = <span class="title class_">Function</span>-&gt;<span class="title class_">Script</span>.<span class="title class_">GetData</span>();</span><br><span class="line">    <span class="title class_">FPlatformMemory</span>::<span class="title class_">Memcpy</span>(<span class="title class_">Data</span>, <span class="title class_">ScriptMagicHeader</span>, <span class="title class_">ScriptMagicHeaderSize</span>);</span><br><span class="line">    <span class="title class_">FPlatformMemory</span>::<span class="title class_">WriteUnaligned</span>&lt;<span class="title class_">ULuaFunction</span>*&gt;(<span class="title class_">Data</span> + <span class="title class_">ScriptMagicHeaderSize</span>, <span class="variable language_">this</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>从上面的代码可以看出，当覆盖的是C++的函数时候往FuncMap中添加LuaFunction，当是蓝图函数的时候就直接拿传递进来的Function改造将NativeFunc设置成execScriptCallLua</p>
+<h2 id="C-调用被Lua覆写的C-或者蓝图函数"><a href="#C-调用被Lua覆写的C-或者蓝图函数" class="headerlink" title="C++调用被Lua覆写的C++或者蓝图函数"></a>C++调用被Lua覆写的C++或者蓝图函数</h2><p>比如当我们调用下面的函数的时候：</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="title function_">UFUNCTION</span>(<span class="title class_">BlueprintNativeEvent</span>,<span class="title class_">BlueprintCallable</span>)</span><br><span class="line"><span class="keyword">void</span> <span class="title class_">SpawnText</span>();</span><br><span class="line"><span class="keyword">void</span> <span class="title class_">UTPSGameInstance</span>::<span class="title class_">SpawnText</span>_Implementation()</span><br><span class="line">&#123;</span><br><span class="line">    <span class="title class_">GEngine</span>-&gt;<span class="title class_">AddOnScreenDebugMessage</span>(<span class="number">1</span>,<span class="number">10</span>,<span class="title class_">FColor</span>::<span class="title class_">White</span>,<span class="title function_">TEXT</span>(<span class="string">&quot;C++ SpawnText_Implementation&quot;</span>));</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>可以看到函数会直接走到</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">static</span> <span class="title class_">FName</span> NAME_UTPSGameInstance_SpawnText = <span class="title class_">FName</span>(<span class="title function_">TEXT</span>(<span class="string">&quot;SpawnText&quot;</span>));</span><br><span class="line"><span class="keyword">void</span> <span class="title class_">UTPSGameInstance</span>::<span class="title class_">SpawnText</span>()</span><br><span class="line">&#123;</span><br><span class="line">    <span class="title class_">ProcessEvent</span>(<span class="title class_">FindFunctionChecked</span>(NAME_UTPSGameInstance_SpawnText),<span class="variable constant_">NULL</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>首先是通过FindFunctionChecked查找FuncMap里面的函数，就可以找到之前覆盖的LuaFunction，这样就调用到对应的execCallLua和execScriptCallLua 进而调到lua的里面覆写的函数。</p>
+<h2 id="Lua调用C-UFuncition函数流程"><a href="#Lua调用C-UFuncition函数流程" class="headerlink" title="Lua调用C++UFuncition函数流程"></a>Lua调用C++UFuncition函数流程</h2><p>创建Class的Matetable的时候会把C++的Class_Index函数与__index绑定</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="title function_">luaL_newmetatable</span>(L, <span class="title class_">MetatableName</span>);</span><br><span class="line"><span class="title function_">lua_pushstring</span>(L, <span class="string">&quot;__index&quot;</span>);</span><br><span class="line"><span class="title function_">lua_pushcfunction</span>(L, <span class="title class_">Class</span>_Index);</span><br><span class="line"><span class="title function_">lua_rawset</span>(L, -<span class="number">3</span>);</span><br></pre></td></tr></table></figure>
+<p>因此当lua调用函数的时候发现没有对应的对象就会触发__index，因此下面我们就从C++的Class_Index函数函数开始分析：</p>
+<p>下面是Class_Index函数：</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br></pre></td><td class="code"><pre><span class="line">int32 <span class="title class_">Class</span>_Index(lua_State *L)</span><br><span class="line">&#123;</span><br><span class="line"> int size= <span class="title function_">lua_gettop</span>(L);</span><br><span class="line"> <span class="title class_">GetField</span>(L);</span><br><span class="line"></span><br><span class="line"> auto <span class="title class_">Ptr</span> = <span class="title function_">lua_touserdata</span>(L, -<span class="number">1</span>);</span><br><span class="line"> <span class="keyword">if</span> (!<span class="title class_">Ptr</span>)</span><br><span class="line"> <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line"></span><br><span class="line"> auto <span class="title class_">Property</span> = static_cast&lt;<span class="title class_">TSharedPtr</span>&lt;<span class="title class_">UnLua</span>::<span class="title class_">ITypeOps</span>&gt;*&gt;(<span class="title class_">Ptr</span>);</span><br><span class="line"> <span class="keyword">if</span> (!<span class="title class_">Property</span>-&gt;<span class="title class_">IsValid</span>())</span><br><span class="line"> <span class="keyword">return</span> <span class="number">0</span>;</span><br><span class="line"> </span><br><span class="line"> auto <span class="title class_">Self</span> = <span class="title class_">GetCppInstance</span>(L, <span class="number">1</span>);</span><br><span class="line"> <span class="keyword">if</span> (!<span class="title class_">Self</span>)</span><br><span class="line"> <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line"></span><br><span class="line"> <span class="keyword">if</span> (<span class="title class_">UnLua</span>::<span class="title class_">LowLevel</span>::<span class="title class_">IsReleasedPtr</span>(<span class="title class_">Self</span>))</span><br><span class="line"> <span class="keyword">return</span> <span class="title function_">luaL_error</span>(L, <span class="title function_">TCHAR_TO_UTF8</span>(*<span class="title class_">FString</span>::<span class="title class_">Printf</span>(<span class="title function_">TEXT</span>(<span class="string">&quot;attempt to read property &#x27;%s&#x27; on released object&quot;</span>), *(*<span class="title class_">Property</span>)-&gt;<span class="title class_">GetName</span>())));</span><br><span class="line"></span><br><span class="line"> <span class="keyword">if</span> (!<span class="title class_">UnLua</span>::<span class="title class_">LowLevel</span>::<span class="title class_">CheckPropertyOwner</span>(L, (*<span class="title class_">Property</span>).<span class="title class_">Get</span>(), <span class="title class_">Self</span>))</span><br><span class="line"> <span class="keyword">return</span> <span class="number">0</span>;</span><br><span class="line"></span><br><span class="line">    (*<span class="title class_">Property</span>)-&gt;<span class="title class_">ReadValue</span>_InContainer(L, <span class="title class_">Self</span>, <span class="literal">false</span>);</span><br><span class="line"> <span class="title function_">lua_remove</span>(L, -<span class="number">2</span>);</span><br><span class="line"> <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>当触发Class_Index函数的时候栈是什么样的呢，在对GetField函数分析可以得出大概如下：<br><img src="/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/image.png" alt="alt text"></p>
+<p>其中包含对应的Class的和变量名称或者函数名称。</p>
+<p>对于注册绑定的功能位于GetField函数里面，接下来分析下该函数</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="variable constant_">FORCEINLINE</span> <span class="keyword">static</span> int32 <span class="title class_">GetField</span>(lua_State* L)</span><br><span class="line">&#123;</span><br><span class="line">    <span class="title function_">lua_getmetatable</span>(L, <span class="number">1</span>); <span class="comment">//获取栈底的matetable放入栈顶</span></span><br><span class="line">    <span class="title function_">lua_pushvalue</span>(L, <span class="number">2</span>);   <span class="comment">//获取栈底往上数第二的元素放到栈顶</span></span><br><span class="line">    int32 <span class="title class_">Type</span> = <span class="title function_">lua_rawget</span>(L, -<span class="number">2</span>); <span class="comment">//在matetable查找栈顶的key，并移除栈顶将查找到的对象放入栈顶，没找到的话此时栈顶值为nil </span></span><br><span class="line">    <span class="keyword">if</span> (<span class="title class_">Type</span> == <span class="variable constant_">LUA_TNIL</span>) <span class="comment">//表示在matetable没有找到key的value，则表示不存在</span></span><br><span class="line">        <span class="title class_">GetFieldInternal</span>(L); </span><br><span class="line">    <span class="title function_">lua_remove</span>(L, -<span class="number">2</span>);</span><br><span class="line">    <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>接下来进入到GetFieldInternal(L);</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">static</span> <span class="keyword">void</span> <span class="title class_">GetFieldInternal</span>(lua_State* L) </span><br><span class="line">&#123;</span><br><span class="line">    <span class="title function_">lua_pop</span>(L, <span class="number">1</span>);  <span class="comment">//把栈顶的nil弹出来</span></span><br><span class="line"></span><br><span class="line">    <span class="title function_">lua_pushstring</span>(L, <span class="string">&quot;__name&quot;</span>);  <span class="comment">//插入__name到栈顶</span></span><br><span class="line">    auto <span class="title class_">Type</span> = <span class="title function_">lua_rawget</span>(L, -<span class="number">2</span>); <span class="comment">//然后在前面的inst里面查找__name并加入到栈顶</span></span><br><span class="line">    <span class="title function_">check</span>(<span class="title class_">Type</span> == <span class="variable constant_">LUA_TSTRING</span>);   <span class="comment">//检查是否字符串</span></span><br><span class="line"></span><br><span class="line">    <span class="keyword">const</span> char* <span class="title class_">ClassName</span> = <span class="title function_">lua_tostring</span>(L, -<span class="number">1</span>);  <span class="comment">// 获取栈顶的的字符串</span></span><br><span class="line">    <span class="keyword">const</span> char* <span class="title class_">FieldName</span> = <span class="title function_">lua_tostring</span>(L, <span class="number">2</span>);   <span class="comment">// 获取栈底第二的Name</span></span><br><span class="line"></span><br><span class="line">    <span class="title function_">lua_pop</span>(L, <span class="number">1</span>); <span class="comment">// 弹出类名</span></span><br><span class="line"></span><br><span class="line">    <span class="comment">// <span class="doctag">TODO:</span> refactor</span></span><br><span class="line">    <span class="keyword">const</span> auto <span class="title class_">Registry</span> = <span class="title class_">UnLua</span>::<span class="title class_">FLuaEnv</span>::<span class="title class_">FindEnv</span>(L)-&gt;<span class="title class_">GetClassRegistry</span>(); <span class="comment">//类注册器</span></span><br><span class="line">    <span class="title class_">FClassDesc</span>* <span class="title class_">ClassDesc</span> = <span class="title class_">Registry</span>-&gt;<span class="title class_">Register</span>(<span class="title class_">ClassName</span>); <span class="comment">//获取注册的类</span></span><br><span class="line">    <span class="title class_">TSharedPtr</span>&lt;<span class="title class_">FFieldDesc</span>&gt; <span class="title class_">Field</span> = <span class="title class_">ClassDesc</span>-&gt;<span class="title class_">RegisterField</span>(<span class="title class_">FieldName</span>, <span class="title class_">ClassDesc</span>); <span class="comment">//生成注册信息</span></span><br><span class="line">    <span class="keyword">if</span> (<span class="title class_">Field</span> &amp;&amp; <span class="title class_">Field</span>-&gt;<span class="title class_">IsValid</span>()) </span><br><span class="line">    &#123;</span><br><span class="line">        bool bCached = <span class="literal">false</span>;</span><br><span class="line">        bool bInherited = <span class="title class_">Field</span>-&gt;<span class="title class_">IsInherited</span>();</span><br><span class="line"></span><br><span class="line">        <span class="comment">//bInherited   删除一些代码</span></span><br><span class="line"></span><br><span class="line">        <span class="keyword">if</span> (!bCached)  </span><br><span class="line">        &#123;</span><br><span class="line">            <span class="title class_">PushField</span>(L, <span class="title class_">Field</span>);                <span class="comment">// Property / closure</span></span><br><span class="line">            <span class="title function_">lua_pushvalue</span>(L, <span class="number">2</span>);                <span class="comment">// key</span></span><br><span class="line">            <span class="title function_">lua_pushvalue</span>(L, -<span class="number">2</span>);               <span class="comment">// Property / closure</span></span><br><span class="line">            <span class="title function_">lua_rawset</span>(L, -<span class="number">4</span>);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">if</span> (bInherited)</span><br><span class="line">        &#123;</span><br><span class="line">            <span class="title function_">lua_remove</span>(L, -<span class="number">2</span>);</span><br><span class="line">            <span class="title function_">lua_pushvalue</span>(L, <span class="number">2</span>);                <span class="comment">// key</span></span><br><span class="line">            <span class="title function_">lua_pushvalue</span>(L, -<span class="number">2</span>);               <span class="comment">// Property / closure</span></span><br><span class="line">            <span class="title function_">lua_rawset</span>(L, -<span class="number">4</span>);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">else</span></span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">if</span> (<span class="title class_">ClassDesc</span>-&gt;<span class="title class_">IsClass</span>())</span><br><span class="line">        &#123;</span><br><span class="line">            <span class="title function_">luaL_getmetatable</span>(L, <span class="string">&quot;UClass&quot;</span>);</span><br><span class="line">            <span class="title function_">lua_pushvalue</span>(L, <span class="number">2</span>);                <span class="comment">// push key</span></span><br><span class="line">            <span class="title function_">lua_rawget</span>(L, -<span class="number">2</span>);</span><br><span class="line">            <span class="title function_">lua_remove</span>(L, -<span class="number">2</span>);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">else</span></span><br><span class="line">        &#123;</span><br><span class="line">            <span class="title function_">lua_pushnil</span>(L);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>下面着重对下面这个代码的栈分析一下：</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (!bCached)</span><br><span class="line">&#123;</span><br><span class="line">   <span class="title class_">PushField</span>(L, <span class="title class_">Field</span>);                <span class="comment">// Property / closure</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>初始的栈是这样的<br><img src="/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/image.png" alt="alt text"><br>看到 PushField(L, Field);里面的注册函数部分</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">template &lt;typename T&gt;</span><br><span class="line"><span class="keyword">void</span> <span class="title class_">FObjectRegistry</span>::<span class="title class_">Push</span>(lua_State* L, <span class="title class_">TSharedPtr</span>&lt;T&gt; <span class="title class_">Ptr</span>)</span><br><span class="line">&#123;</span><br><span class="line">    <span class="keyword">const</span> auto <span class="title class_">Userdata</span> = <span class="title function_">lua_newuserdata</span>(L, <span class="title function_">sizeof</span>(<span class="title class_">TSharedPtr</span>&lt;T&gt;));</span><br><span class="line">    <span class="title function_">luaL_getmetatable</span>(L, <span class="string">&quot;TSharedPtr&quot;</span>);</span><br><span class="line">    <span class="title function_">lua_setmetatable</span>(L, -<span class="number">2</span>);</span><br><span class="line">    <span class="title function_">new</span>(<span class="title class_">Userdata</span>) <span class="title class_">TSharedPtr</span>&lt;T&gt;(<span class="title class_">Ptr</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p><img src="/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/image3.png" alt="alt text"></p>
+<p>最终栈顶是一个TSharedPtr<T>的userdata，接下来继续看PushField函数</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (<span class="title class_">Function</span>-&gt;<span class="title class_">IsLatentFunction</span>())</span><br><span class="line">&#123;</span><br><span class="line">    <span class="title function_">lua_pushcclosure</span>(L, <span class="title class_">Class</span>_CallLatentFunction, <span class="number">1</span>);   <span class="comment">// closure</span></span><br><span class="line">&#125;</span><br><span class="line"><span class="keyword">else</span></span><br><span class="line">&#123;</span><br><span class="line">    <span class="title function_">lua_pushcclosure</span>(L, <span class="title class_">Class</span>_CallUFunction, <span class="number">1</span>);        <span class="comment">// closure</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>这一部分是表示将一个C++函数和一个upvalue作为一个闭包推入栈顶，并从栈中弹出upvalue</p>
+<p><img src="/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/image-1.png" alt="alt text"></p>
+<p>现在回到GetFieldInternal函数</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (!bCached)</span><br><span class="line">&#123;</span><br><span class="line">    <span class="title class_">PushField</span>(L, <span class="title class_">Field</span>);                <span class="comment">// Property / closure</span></span><br><span class="line">    <span class="title function_">lua_pushvalue</span>(L, <span class="number">2</span>);                <span class="comment">// 把Name拷贝一份到栈顶，closure的index成了-2</span></span><br><span class="line">    <span class="title function_">lua_pushvalue</span>(L, -<span class="number">2</span>);               <span class="comment">//把closure拷贝一份到栈顶</span></span><br><span class="line">    <span class="title function_">lua_rawset</span>(L, -<span class="number">4</span>);                  <span class="comment">// 把-1和-2号位置的设置到-4号位置，然后出栈-1和-2</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>执行完之后栈里面又剩下Inst和Name，后面执行这个清理栈</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="title function_">lua_remove</span>(L, -<span class="number">2</span>);</span><br></pre></td></tr></table></figure>
+<p>接下来是调用的步骤：<br>前面已经看到对于非延迟的函数其会调用的Class_CallUFunction函数:</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line">int32 <span class="title class_">Class</span>_CallUFunction(lua_State *L)</span><br><span class="line">&#123;</span><br><span class="line">    <span class="comment">//!!!Fix!!!</span></span><br><span class="line">    <span class="comment">//delete desc when is not valid</span></span><br><span class="line">    auto&amp; <span class="title class_">Env</span> = <span class="title class_">UnLua</span>::<span class="title class_">FLuaEnv</span>::<span class="title class_">FindEnvChecked</span>(L);</span><br><span class="line">    auto <span class="title class_">Function</span> = <span class="title class_">Env</span>.<span class="title class_">GetObjectRegistry</span>()-&gt;<span class="title class_">Get</span>&lt;<span class="title class_">FFunctionDesc</span>&gt;(L, <span class="title function_">lua_upvalueindex</span>(<span class="number">1</span>));</span><br><span class="line">    <span class="keyword">if</span> (!<span class="title class_">Function</span>-&gt;<span class="title class_">IsValid</span>())</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="title function_">UE_LOG</span>(<span class="title class_">LogUnLua</span>, <span class="title class_">Log</span>, <span class="title function_">TEXT</span>(<span class="string">&quot;%s: Invalid function descriptor!&quot;</span>), <span class="title function_">ANSI_TO_TCHAR</span>(__FUNCTION__));</span><br><span class="line">        <span class="keyword">return</span> <span class="number">0</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    int32 <span class="title class_">NumParams</span> = <span class="title function_">lua_gettop</span>(L);</span><br><span class="line">    int32 <span class="title class_">NumResults</span> = <span class="title class_">Function</span>-&gt;<span class="title class_">CallUE</span>(L, <span class="title class_">NumParams</span>);</span><br><span class="line">    <span class="keyword">return</span> <span class="title class_">NumResults</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>上面的重点是lua_upvalueindex(1)获取到upvalue，从而获取到UserData转成FuncDesc，Function-&gt;CallUE(L, NumParams);这个就是实际调用到C++函数并提取lua传递过来的参数赋值给C++函数的地方，<br><img src="/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/image-2.png" alt="调用栈"></p>
+<h2 id="静态到出C-到Lua"><a href="#静态到出C-到Lua" class="headerlink" title="静态到出C++到Lua"></a>静态到出C++到Lua</h2><p>LuaEvn初始化的时候就会导出</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">auto <span class="title class_">ExportedNonReflectedClasses</span> = <span class="title class_">GetExportedNonReflectedClasses</span>();</span><br><span class="line"><span class="keyword">for</span> (<span class="keyword">const</span> auto&amp; <span class="title class_">Pair</span> : <span class="title class_">ExportedNonReflectedClasses</span>)</span><br><span class="line">    <span class="title class_">Pair</span>.<span class="property">Value</span>-&gt;<span class="title class_">Register</span>(L);</span><br></pre></td></tr></table></figure>
+
+<p>下面就是静态注册的过程，首先创建ClassName对应的metatable</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br></pre></td><td class="code"><pre><span class="line"> <span class="title function_">luaL_newmetatable</span>(L, <span class="title class_">ClassName</span>.<span class="title class_">Get</span>());</span><br><span class="line"></span><br><span class="line"><span class="keyword">if</span> (!<span class="title class_">SuperClassName</span>.<span class="title class_">IsEmpty</span>())</span><br><span class="line">&#123;</span><br><span class="line">    <span class="title function_">lua_pushstring</span>(L, <span class="string">&quot;Super&quot;</span>);</span><br><span class="line">    <span class="title class_">Type</span> = <span class="title function_">luaL_getmetatable</span>(L, <span class="title function_">TCHAR_TO_UTF8</span>(*<span class="title class_">SuperClassName</span>));</span><br><span class="line">    <span class="title function_">check</span>(<span class="title class_">Type</span> == <span class="variable constant_">LUA_TTABLE</span>);</span><br><span class="line">    <span class="title function_">lua_rawset</span>(L, -<span class="number">3</span>);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="title function_">lua_pushstring</span>(L, <span class="string">&quot;__index&quot;</span>);</span><br><span class="line"><span class="title function_">lua_pushvalue</span>(L, -<span class="number">2</span>);</span><br><span class="line"><span class="keyword">if</span> (<span class="title class_">Properties</span>.<span class="title class_">Num</span>() &gt; <span class="number">0</span> || !<span class="title class_">SuperClassName</span>.<span class="title class_">IsEmpty</span>())</span><br><span class="line">&#123;</span><br><span class="line">    <span class="title function_">lua_pushcclosure</span>(L, <span class="title class_">UnLua</span>::<span class="title class_">Index</span>, <span class="number">1</span>);</span><br><span class="line">&#125;</span><br><span class="line"><span class="title function_">lua_rawset</span>(L, -<span class="number">3</span>);</span><br><span class="line"></span><br><span class="line"><span class="title function_">lua_pushstring</span>(L, <span class="string">&quot;__newindex&quot;</span>);</span><br><span class="line"><span class="title function_">lua_pushvalue</span>(L, -<span class="number">2</span>);</span><br><span class="line"><span class="keyword">if</span> (<span class="title class_">Properties</span>.<span class="title class_">Num</span>() &gt; <span class="number">0</span> || !<span class="title class_">SuperClassName</span>.<span class="title class_">IsEmpty</span>())</span><br><span class="line">&#123;</span><br><span class="line">    <span class="title function_">lua_pushcclosure</span>(L, <span class="title class_">UnLua</span>::<span class="title class_">NewIndex</span>, <span class="number">1</span>);</span><br><span class="line">&#125;</span><br><span class="line"><span class="title function_">lua_rawset</span>(L, -<span class="number">3</span>);</span><br><span class="line"></span><br><span class="line"><span class="title function_">lua_pushvalue</span>(L, -<span class="number">1</span>);                    <span class="comment">// set metatable to self</span></span><br><span class="line"><span class="title function_">lua_setmetatable</span>(L, -<span class="number">2</span>);</span><br></pre></td></tr></table></figure>
+<p>然后就开始注册成员函数和成员变量</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">for</span> (<span class="keyword">const</span> auto&amp; <span class="title class_">Property</span> : <span class="title class_">Properties</span>)</span><br><span class="line">    <span class="title class_">Property</span>-&gt;<span class="title class_">Register</span>(L);</span><br><span class="line"></span><br><span class="line"><span class="keyword">for</span> (<span class="keyword">const</span> auto&amp; <span class="title class_">MemberFunc</span> : <span class="title class_">Functions</span>)</span><br><span class="line">    <span class="title class_">MemberFunc</span>-&gt;<span class="title class_">Register</span>(L);</span><br><span class="line"></span><br><span class="line"><span class="keyword">for</span> (<span class="keyword">const</span> auto&amp; <span class="title class_">Func</span> : <span class="title class_">GlueFunctions</span>)</span><br><span class="line">    <span class="title class_">Func</span>-&gt;<span class="title class_">Register</span>(L);</span><br></pre></td></tr></table></figure>
+
+<p>最后把这个注册的matetable写入到UE的表中</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="title function_">lua_getglobal</span>(L, <span class="string">&quot;UE&quot;</span>);</span><br><span class="line"><span class="title function_">lua_pushstring</span>(L, <span class="title class_">ClassName</span>.<span class="title class_">Get</span>());</span><br><span class="line"><span class="title function_">lua_pushvalue</span>(L, -<span class="number">3</span>);</span><br><span class="line"><span class="title function_">lua_rawset</span>(L, -<span class="number">3</span>);</span><br><span class="line"><span class="title function_">lua_pop</span>(L, <span class="number">2</span>);</span><br></pre></td></tr></table></figure>
+<p>成员函数是下面的注册方式</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="title function_">lua_pushstring</span>(L, <span class="title function_">TCHAR_TO_UTF8</span>(*<span class="title class_">Name</span>));   <span class="comment">//函数名到栈顶</span></span><br><span class="line"><span class="title function_">lua_pushlightuserdata</span>(L, <span class="variable language_">this</span>);            <span class="comment">//导出函数对象指针到栈顶</span></span><br><span class="line"><span class="title function_">lua_pushcclosure</span>(L, <span class="title class_">InvokeFunction</span>, <span class="number">1</span>);    <span class="comment">//推一个闭包函数并把lightuserdata作为upvalue</span></span><br><span class="line"><span class="title function_">lua_rawset</span>(L, -<span class="number">3</span>);                         <span class="comment">//将Name和那个闭包作为key-value设置到matetable中</span></span><br></pre></td></tr></table></figure>
+
+<h2 id="Lua调用静态导出的函数"><a href="#Lua调用静态导出的函数" class="headerlink" title="Lua调用静态导出的函数"></a>Lua调用静态导出的函数</h2><p>根据上面的就能看出来，函数调用的时候最终会调用到这个C闭包函数InvokeFunction</p>
+<figure class="highlight js"><figcaption><span>C++</span></figcaption><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="title class_">IExportedFunction</span> *<span class="title class_">Func</span> = (<span class="title class_">IExportedFunction</span>*)<span class="title function_">lua_touserdata</span>(L, <span class="title function_">lua_upvalueindex</span>(<span class="number">1</span>));</span><br><span class="line"><span class="keyword">return</span> <span class="title class_">Func</span> ? <span class="title class_">Func</span>-&gt;<span class="title class_">Invoke</span>(L) : <span class="number">0</span>;</span><br></pre></td></tr></table></figure>
+
+
+    </div>
+
+    
+    
+    
+
+    <footer class="post-footer">
+          
+
+<div class="post-copyright">
+<ul>
+  <li class="post-copyright-author">
+      <strong>本文作者： </strong>FixCode
+  </li>
+  <li class="post-copyright-link">
+      <strong>本文链接：</strong>
+      <a href="http://www.fixcod.cn/2024/04/14/Unlua%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/" title="Unlua代码分析">http://www.fixcod.cn/2024/04/14/Unlua代码分析/</a>
+  </li>
+  <li class="post-copyright-license">
+      <strong>版权声明： </strong>本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" rel="noopener" target="_blank"><i class="fab fa-fw fa-creative-commons"></i>BY-NC-SA</a> 许可协议。转载请注明出处！
+  </li>
+</ul>
+</div>
+
+          <div class="post-tags">
+              <a href="/tags/Unlua/" rel="tag"><i class="fa fa-tag"></i> Unlua</a>
+          </div>
+
+        
+
+          <div class="post-nav">
+            <div class="post-nav-item">
+                <a href="/2024/04/10/%E7%A4%BA%E4%BE%8B%E6%96%87%E7%AB%A0/" rel="prev" title="示例文章">
+                  <i class="fa fa-angle-left"></i> 示例文章
+                </a>
+            </div>
+            <div class="post-nav-item">
+            </div>
+          </div>
+    </footer>
+  </article>
+</div>
+
+
+
+
+
+
+    <div class="comments utterances-container"></div>
+</div>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+
+  <div class="copyright">
+    &copy; 
+    <span itemprop="copyrightYear">2024</span>
+    <span class="with-love">
+      <i class="fa fa-heart"></i>
+    </span>
+    <span class="author" itemprop="copyrightHolder">FixCode</span>
+  </div>
+<div class="wordcount">
+  <span class="post-meta-item">
+    <span class="post-meta-item-icon">
+      <i class="fa fa-chart-line"></i>
+    </span>
+      <span>站点总字数：</span>
+    <span title="站点总字数">3k</span>
+  </span>
+  <span class="post-meta-item">
+    <span class="post-meta-item-icon">
+      <i class="fa fa-coffee"></i>
+    </span>
+      <span>站点阅读时长 &asymp;</span>
+    <span title="站点阅读时长">10 分钟</span>
+  </span>
+</div>
+<div class="busuanzi-count">
+    <span class="post-meta-item" id="busuanzi_container_site_uv">
+      <span class="post-meta-item-icon">
+        <i class="fa fa-user"></i>
+      </span>
+      <span class="site-uv" title="总访客量">
+        <span id="busuanzi_value_site_uv"></span>
+      </span>
+    </span>
+    <span class="post-meta-item" id="busuanzi_container_site_pv">
+      <span class="post-meta-item-icon">
+        <i class="fa fa-eye"></i>
+      </span>
+      <span class="site-pv" title="总访问量">
+        <span id="busuanzi_value_site_pv"></span>
+      </span>
+    </span>
+</div>
+
+    </div>
+  </footer>
+
+  
+  <div class="reading-progress-bar"></div>
+  <a role="button" class="book-mark-link book-mark-link-fixed"></a>
+
+<noscript>
+  <div class="noscript-warning">Theme NexT works best with JavaScript enabled</div>
+</noscript>
+
+
+  
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.1/anime.min.js" integrity="sha256-XL2inqUJaslATFnHdJOi9GfQ60on8Wx1C2H8DYiN1xY=" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/next-theme-pjax/0.6.0/pjax.min.js" integrity="sha256-vxLn1tSKWD4dqbMRyv940UYw4sXgMtYcK6reefzZrao=" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/medium-zoom/1.1.0/medium-zoom.min.js" integrity="sha256-ZgMyDAIYDYGxbcpJcfUnYwNevG/xi9OHKaR/8GK+jWc=" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pangu/4.0.7/pangu.min.js" integrity="sha256-j+yj56cdEY2CwkVtGyz18fNybFGpMGJ8JxG3GSyO2+I=" crossorigin="anonymous"></script>
+<script src="/js/comments.js"></script><script src="/js/utils.js"></script><script src="/js/motion.js"></script><script src="/js/next-boot.js"></script><script src="/js/bookmark.js"></script><script src="/js/pjax.js"></script>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/hexo-generator-searchdb/1.4.1/search.js" integrity="sha256-1kfA5uHPf65M5cphT2dvymhkuyHPQp5A53EGZOnOLmc=" crossorigin="anonymous"></script>
+<script src="/js/third-party/search/local-search.js"></script>
+
+  <script class="next-config" data-name="pdf" type="application/json">{"object_url":{"url":"https://cdnjs.cloudflare.com/ajax/libs/pdfobject/2.2.12/pdfobject.min.js","integrity":"sha256-g2xji1rlE3KsGVClvuxTbcR0Kn2+wtQADSff2Tbb4zA="},"url":"/lib/pdf/web/viewer.html"}</script>
+  <script src="/js/third-party/tags/pdf.js"></script>
+
+
+
+
+  <script src="/js/third-party/pace.js"></script>
+
+
+  
+  <script data-pjax async src="https://busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script>
+
+
+
+
+<script src="https://cdn.jsdelivr.net/npm/darkmode-js@1.5.7/lib/darkmode-js.min.js"></script>
+
+<script>
+var options = {
+  bottom: '64px',
+  right: '32px',
+  left: 'unset',
+  time: '0.5s',
+  mixColor: 'transparent',
+  backgroundColor: 'transparent',
+  buttonColorDark: '#100f2c',
+  buttonColorLight: '#fff',
+  saveInCookies: true,
+  label: '🌓',
+  autoMatchOsTheme: true
+}
+const darkmode = new Darkmode(options);
+window.darkmode = darkmode;
+darkmode.showWidget();
+</script>
+<script class="next-config" data-name="utterances" type="application/json">{"enable":true,"repo":"1778750163/next_utterances","issue_term":"pathname","theme":"github-light"}</script>
+<script src="/js/third-party/comments/utterances.js"></script>
+
+</body>
+</html>

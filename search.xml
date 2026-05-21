@@ -1,0 +1,692 @@
+<?xml version="1.0" encoding="utf-8"?>
+<search>
+  <entry>
+    <title>UE 网络同步机制避坑：从 BeginPlay、OnRep 到 SubObject、FastArray、Reliable 与 ReplicationGraph</title>
+    <url>/2026/05/21/ue-network-replication-learning/</url>
+    <content><![CDATA[<blockquote>
+<p>本文面向已经写过 UE 网络玩法、但经常被复制时序、RPC 路由、Owner、Relevancy、Dormancy、SubObject、FastArray 搞混的开发者。<br>适用范围以 <strong>UE4.26 &#x2F; UE4.27 到 UE5.x 的传统 Generic Replication &#x2F; ReplicationGraph</strong> 为主。UE5 Iris 在 SubObject、FastArray、ReplicationFragment 等细节上有差异，文中会单独标注。</p>
+</blockquote>
+<p>UE 的网络同步最容易误解的一点是：<strong>它不是把服务端和客户端的对象自动变成完全一样</strong>。UE 真正做的是：</p>
+<pre class="mermaid">flowchart TB
+    A["服务端拥有权威状态"]
+    B["NetDriver 按连接筛选 Actor"]
+    C["ActorChannel 负责<br/>“某个 Actor 对某个连接”的复制"]
+    D["属性 / RPC / Component / SubObject<br/>被序列化成 bunch"]
+    E["客户端接收 bunch"]
+    F["创建 Actor / 解析对象引用<br/>写入属性 / 执行 RPC / 触发 OnRep"]
+    A --> B --> C --> D --> E --> F</pre>
+
+<p>所以，玩法开发时比“这个变量怎么同步”更重要的问题是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">这个数据是谁拥有？</span><br><span class="line">谁有权修改？</span><br><span class="line">谁能看到？</span><br><span class="line">它是长期状态还是瞬时事件？</span><br><span class="line">它是否需要服务端校验？</span><br><span class="line">它是否只给 Owner？</span><br><span class="line">它是高频还是低频？</span><br><span class="line">它是否需要持久化？</span><br></pre></td></tr></table></figure>
+
+<p>只要这几个问题没有想清楚，后面无论用 <code>Replicated</code>、<code>RepNotify</code>、<code>RPC</code>、<code>FastArray</code>、<code>SubObject</code> 还是 <code>ReplicationGraph</code>，都很容易写出“本机 PIE 正常、Dedicated Server 一跑就炸”的网络 Bug。</p>
+<h2 id="总体心智模型：状态、事件、权限、可见性不要混在一起"><a href="#总体心智模型：状态、事件、权限、可见性不要混在一起" class="headerlink" title="总体心智模型：状态、事件、权限、可见性不要混在一起"></a>总体心智模型：状态、事件、权限、可见性不要混在一起</h2><p>UE 网络玩法里最常见的错，不是 API 拼错，而是概念边界混乱。</p>
+<h3 id="Authority、Owner、Relevancy、Dormancy-是四件事"><a href="#Authority、Owner、Relevancy、Dormancy-是四件事" class="headerlink" title="Authority、Owner、Relevancy、Dormancy 是四件事"></a>Authority、Owner、Relevancy、Dormancy 是四件事</h3><table>
+<thead>
+<tr>
+<th>概念</th>
+<th>解决的问题</th>
+<th>常见误解</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Authority</td>
+<td>谁能最终决定状态</td>
+<td>以为 Owner 就是 Authority</td>
+</tr>
+<tr>
+<td>Owner &#x2F; Owning Connection</td>
+<td>Client RPC、OwnerOnly 条件复制发给谁</td>
+<td>以为 Actor 在服务端创建，所以 Owner 就是服务器</td>
+</tr>
+<tr>
+<td>Relevancy</td>
+<td>某个连接当前是否应该看到这个 Actor</td>
+<td>以为 <code>bReplicates=true</code> 就所有人一定收到</td>
+</tr>
+<tr>
+<td>Dormancy</td>
+<td>Actor 是否暂时跳过复制检查</td>
+<td>休眠后改属性却不唤醒</td>
+</tr>
+</tbody></table>
+<h3 id="状态和事件必须分开"><a href="#状态和事件必须分开" class="headerlink" title="状态和事件必须分开"></a>状态和事件必须分开</h3><p><strong>属性复制适合长期状态</strong>：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">Health</span><br><span class="line">Ammo</span><br><span class="line">TeamId</span><br><span class="line">CurrentWeapon</span><br><span class="line">bIsDead</span><br><span class="line">DoorState</span><br><span class="line">BuildingLevel</span><br></pre></td></tr></table></figure>
+
+<p>这些数据的特点是：客户端最终需要收敛到服务端最新值，中间过程可以丢。</p>
+<p><strong>RPC 更适合瞬时事件或请求</strong>：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">PlayMuzzleFX</span><br><span class="line">ShowErrorMessage</span><br><span class="line">Client_PlayHitReact</span><br><span class="line">Server_RequestUseItem</span><br><span class="line">Server_RequestOpenChest</span><br></pre></td></tr></table></figure>
+
+<p>这些数据的特点是：它发生一次就是一次，错过了不应该靠“属性最终值”来推断。</p>
+<h3 id="一个实用分层"><a href="#一个实用分层" class="headerlink" title="一个实用分层"></a>一个实用分层</h3><pre class="mermaid">flowchart LR
+    subgraph 玩法网络分层
+        direction TB
+        A["<b>Client Request</b><br/>客户端请求服务端做事<br/>Server RPC（必须服务端校验）"]
+        B["<b>Authoritative State</b><br/>服务端权威状态<br/>Replicated Property / FastArray / SubObject"]
+        C["<b>Transient Event</b><br/>瞬时表现<br/>Unreliable RPC / GameplayCue / EventId"]
+        D["<b>Private View</b><br/>私有数据<br/>COND_OwnerOnly / Client RPC"]
+        E["<b>Public View</b><br/>所有人可见的简化状态<br/>普通属性复制 / ReplicationGraph Relevancy"]
+    end</pre>
+
+<p>如果你正在设计一个背包、技能、建筑、任务、UGC 运行时系统，优先用这个分层去拆，而不是一上来就问“这个字段加不加 Replicated”。</p>
+<hr>
+<h2 id="BeginPlay-和-OnRep-顺序为什么容易踩坑"><a href="#BeginPlay-和-OnRep-顺序为什么容易踩坑" class="headerlink" title="BeginPlay 和 OnRep 顺序为什么容易踩坑"></a>BeginPlay 和 OnRep 顺序为什么容易踩坑</h2><p>很多人会下意识认为客户端初始化顺序是：</p>
+<pre class="mermaid">flowchart TB
+    A["BeginPlay"]
+    B["UI / 组件 / 引用都准备好了"]
+    C["之后才会执行 OnRep"]
+    A --> B --> C</pre>
+
+<p>这个理解在网络环境里非常危险。</p>
+<h3 id="动态复制-Actor-的初始属性通常会先于-BeginPlay-被读入"><a href="#动态复制-Actor-的初始属性通常会先于-BeginPlay-被读入" class="headerlink" title="动态复制 Actor 的初始属性通常会先于 BeginPlay 被读入"></a>动态复制 Actor 的初始属性通常会先于 BeginPlay 被读入</h3><p>对动态 Spawn 的 Replicated Actor 来说，客户端第一次收到它时，会通过 ActorChannel 的初始 bunch 创建 Actor，并读入初始复制属性。官方 API 对 <code>PostNetInit</code> 的描述是：Actor 被生成并读入 replicated properties 后调用。</p>
+<p>也就是说，对于动态复制 Actor，<strong>初始复制属性并不是一定晚于 BeginPlay</strong>。</p>
+<p>但是，这并不意味着你可以放心在 <code>BeginPlay</code> 里假设一切都准备好了。因为真实项目里还有：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">PlayerState / Pawn / Controller 互相引用</span><br><span class="line">Replicated Actor 指针延迟解析</span><br><span class="line">Replicated Component / SubObject 初始化</span><br><span class="line">UI 创建时机</span><br><span class="line">AnimInstance / Mesh 初始化时机</span><br><span class="line">Seamless Travel / Late Join / Reconnect</span><br></pre></td></tr></table></figure>
+
+<p>所以最安全的心智模型不是“BeginPlay 一定先”或“OnRep 一定先”，而是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">BeginPlay 和 OnRep 都只是若干初始化入口之一。</span><br><span class="line">真正的业务初始化应该做成幂等 TryInit / TryRefresh。</span><br></pre></td></tr></table></figure>
+
+<h3 id="案例：OnRep-CurrentWeapon-里访问-UI-崩溃"><a href="#案例：OnRep-CurrentWeapon-里访问-UI-崩溃" class="headerlink" title="案例：OnRep_CurrentWeapon 里访问 UI 崩溃"></a>案例：OnRep_CurrentWeapon 里访问 UI 崩溃</h3><p>错误写法：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UPROPERTY</span>(ReplicatedUsing = OnRep_CurrentWeapon)</span><br><span class="line">TObjectPtr&lt;AWeapon&gt; CurrentWeapon;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::OnRep_CurrentWeapon</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    WeaponWidget-&gt;<span class="built_in">SetWeapon</span>(CurrentWeapon);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>问题是 <code>OnRep_CurrentWeapon</code> 执行时：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">WeaponWidget 可能还没创建</span><br><span class="line">HUD 可能还没初始化</span><br><span class="line">PlayerController 可能还没 Possess 完</span><br><span class="line">CurrentWeapon 指针可能还没完全解析</span><br></pre></td></tr></table></figure>
+
+<p>更安全的写法是把每个入口都收敛到一个 <code>TryRefresh</code>：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::OnRep_CurrentWeapon</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    bPendingRefreshWeapon = <span class="literal">true</span>;</span><br><span class="line">    <span class="built_in">TryRefreshWeaponView</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::BeginPlay</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Super::<span class="built_in">BeginPlay</span>();</span><br><span class="line"></span><br><span class="line">    bActorBeginPlayReady = <span class="literal">true</span>;</span><br><span class="line">    <span class="built_in">TryRefreshWeaponView</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::NotifyUIReady</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    bUIReady = <span class="literal">true</span>;</span><br><span class="line">    <span class="built_in">TryRefreshWeaponView</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::TryRefreshWeaponView</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (!bPendingRefreshWeapon)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (!bActorBeginPlayReady)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (!bUIReady)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (!<span class="built_in">IsValid</span>(CurrentWeapon))</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    WeaponWidget-&gt;<span class="built_in">SetWeapon</span>(CurrentWeapon);</span><br><span class="line">    bPendingRefreshWeapon = <span class="literal">false</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>核心思想：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">OnRep 只表示“网络数据到了”</span><br><span class="line">不表示“所有业务依赖都准备好了”</span><br></pre></td></tr></table></figure>
+
+<h3 id="案例：Pawn-BeginPlay-里拿不到-PlayerState"><a href="#案例：Pawn-BeginPlay-里拿不到-PlayerState" class="headerlink" title="案例：Pawn BeginPlay 里拿不到 PlayerState"></a>案例：Pawn BeginPlay 里拿不到 PlayerState</h3><p>错误写法：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::BeginPlay</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Super::<span class="built_in">BeginPlay</span>();</span><br><span class="line"></span><br><span class="line">    AMyPlayerState* PS = <span class="built_in">GetPlayerState</span>&lt;AMyPlayerState&gt;();</span><br><span class="line">    TeamId = PS-&gt;<span class="built_in">GetTeamId</span>();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>客户端上可能出现：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">Character BeginPlay 执行了</span><br><span class="line">但 PlayerState 还没复制到这个 Pawn</span><br><span class="line">GetPlayerState() 返回 nullptr</span><br></pre></td></tr></table></figure>
+
+<p>更安全写法：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::BeginPlay</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Super::<span class="built_in">BeginPlay</span>();</span><br><span class="line">    <span class="built_in">TryInitFromPlayerState</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::OnRep_PlayerState</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Super::<span class="built_in">OnRep_PlayerState</span>();</span><br><span class="line">    <span class="built_in">TryInitFromPlayerState</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::TryInitFromPlayerState</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    AMyPlayerState* PS = <span class="built_in">GetPlayerState</span>&lt;AMyPlayerState&gt;();</span><br><span class="line">    <span class="keyword">if</span> (!<span class="built_in">IsValid</span>(PS))</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    CachedTeamId = PS-&gt;<span class="built_in">GetTeamId</span>();</span><br><span class="line">    <span class="built_in">RefreshTeamVisual</span>();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>结论：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">Pawn BeginPlay 不是 PlayerState Ready 的保证。</span><br><span class="line">PlayerState Ready 应该监听 OnRep_PlayerState。</span><br></pre></td></tr></table></figure>
+
+<h3 id="多个-OnRep-之间没有确定顺序"><a href="#多个-OnRep-之间没有确定顺序" class="headerlink" title="多个 OnRep 之间没有确定顺序"></a>多个 OnRep 之间没有确定顺序</h3><p>一个非常重要的官方规则：<strong>不同 replicated 变量的 OnRep 调用顺序没有确定性</strong>。它不保证按声明顺序、内存顺序，也不保证按服务端标脏顺序。</p>
+<p>错误写法：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UPROPERTY</span>(ReplicatedUsing = OnRep_Weapon)</span><br><span class="line">TObjectPtr&lt;AWeapon&gt; CurrentWeapon;</span><br><span class="line"></span><br><span class="line"><span class="built_in">UPROPERTY</span>(ReplicatedUsing = OnRep_WeaponState)</span><br><span class="line">EWeaponState WeaponState;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::OnRep_WeaponState</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="comment">// 假设 OnRep_Weapon 已经执行过</span></span><br><span class="line">    CurrentWeapon-&gt;<span class="built_in">ApplyState</span>(WeaponState);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>更安全：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::OnRep_Weapon</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="built_in">TryApplyWeaponState</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::OnRep_WeaponState</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="built_in">TryApplyWeaponState</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::TryApplyWeaponState</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (!<span class="built_in">IsValid</span>(CurrentWeapon))</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    CurrentWeapon-&gt;<span class="built_in">ApplyState</span>(WeaponState);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>如果多个字段必须以严格顺序整体生效，优先考虑：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">1. 把它们合并到同一个 replicated struct。</span><br><span class="line">2. OnRep 里只缓存，最终在 PostRepNotifies 里统一处理。</span><br><span class="line">3. 使用显式版本号 / EventId 做收敛。</span><br></pre></td></tr></table></figure>
+
+<h3 id="Component-的-ReadyForReplication"><a href="#Component-的-ReadyForReplication" class="headerlink" title="Component 的 ReadyForReplication"></a>Component 的 ReadyForReplication</h3><p>UE5 中 <code>UActorComponent::ReadyForReplication()</code> 是一个很重要的时机：它表示 owning actor 已经正式 ready for replication，适合在 replicated component 里注册 subobject。</p>
+<p>例如：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">UMyInventoryComponent::ReadyForReplication</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Super::<span class="built_in">ReadyForReplication</span>();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (<span class="built_in">GetOwner</span>() &amp;&amp; <span class="built_in">GetOwner</span>()-&gt;<span class="built_in">HasAuthority</span>() &amp;&amp; !InventoryObject)</span><br><span class="line">    &#123;</span><br><span class="line">        InventoryObject = <span class="built_in">NewObject</span>&lt;UInventoryObject&gt;(<span class="keyword">this</span>);</span><br><span class="line">        <span class="built_in">AddReplicatedSubObject</span>(InventoryObject);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>不要把 Actor 的 <code>BeginPlay</code>、Component 的 <code>BeginPlay</code>、SubObject 的复制注册时机混成一件事。</p>
+<hr>
+<h2 id="Replicated-Actor-指针为什么可能先是-null，之后又能指向正确对象"><a href="#Replicated-Actor-指针为什么可能先是-null，之后又能指向正确对象" class="headerlink" title="Replicated Actor 指针为什么可能先是 null，之后又能指向正确对象"></a>Replicated Actor 指针为什么可能先是 null，之后又能指向正确对象</h2><blockquote>
+<p>客户端收到一个 replicated Actor 指针时，对方 Actor 可能还没创建完成。如果 <code>OnRep_Target</code> 的时候 <code>Target == nullptr</code>，那当 Target 创建完成后，Target 指针怎么指向正确 Actor？</p>
+</blockquote>
+<p>答案是：<strong>UE 复制的是对象引用的 NetGUID，不是内存地址。</strong></p>
+<h3 id="对象引用复制的本质：FNetworkGUID"><a href="#对象引用复制的本质：FNetworkGUID" class="headerlink" title="对象引用复制的本质：FNetworkGUID"></a>对象引用复制的本质：FNetworkGUID</h3><p>服务端复制 Actor 指针时，可以理解为发送：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">TargetActor -&gt; FNetworkGUID</span><br></pre></td></tr></table></figure>
+
+<p>客户端收到后通过 PackageMap 查询：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">FNetworkGUID -&gt; 本地 UObject / AActor</span><br></pre></td></tr></table></figure>
+
+<p>如果 Target Actor 此时还没在客户端创建：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">NetGUID 暂时 unmapped</span><br><span class="line">属性可能暂时表现为 null</span><br><span class="line">系统记录这个未解析引用</span><br></pre></td></tr></table></figure>
+
+<p>等后续 Target Actor 的创建 bunch 到达：</p>
+<pre class="mermaid">flowchart TB
+    A["客户端创建 Target Actor"]
+    B["NetGUID 映射到本地 Actor 实例"]
+    C["之前 unmapped 的引用可以被修正"]
+    A --> B --> C</pre>
+
+<h3 id="例子：Marker-先到，Enemy-后到"><a href="#例子：Marker-先到，Enemy-后到" class="headerlink" title="例子：Marker 先到，Enemy 后到"></a>例子：Marker 先到，Enemy 后到</h3><p>服务端：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">AEnemy* Enemy = <span class="built_in">GetWorld</span>()-&gt;<span class="built_in">SpawnActor</span>&lt;AEnemy&gt;(EnemyClass);</span><br><span class="line">AMyMarker* Marker = <span class="built_in">GetWorld</span>()-&gt;<span class="built_in">SpawnActor</span>&lt;AMyMarker&gt;(MarkerClass);</span><br><span class="line"></span><br><span class="line">Marker-&gt;Target = Enemy;</span><br></pre></td></tr></table></figure>
+
+<p>客户端可能收到：</p>
+<pre class="mermaid">sequenceDiagram
+    participant S as Server
+    participant C as Client
+    S->>C: Marker bunch（含 Marker.Target NetGUID → Enemy）
+    Note over C: Enemy 还没创建<br/>NetGUID 暂时未映射
+    C->>C: Marker.Target == nullptr
+    C->>C: OnRep_Target 执行（Target 为 null）
+    S->>C: Enemy bunch
+    C->>C: Enemy 创建，NetGUID 映射成功
+    C->>C: Marker.Target 自动修正为 Enemy</pre>
+
+<h3 id="业务层不要依赖第一次-OnRep-必然有效"><a href="#业务层不要依赖第一次-OnRep-必然有效" class="headerlink" title="业务层不要依赖第一次 OnRep 必然有效"></a>业务层不要依赖第一次 OnRep 必然有效</h3><p>稳妥写法：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyMarker::OnRep_Target</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="built_in">TryBindTarget</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyMarker::BeginPlay</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Super::<span class="built_in">BeginPlay</span>();</span><br><span class="line">    <span class="built_in">TryBindTarget</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyMarker::Tick</span><span class="params">(<span class="type">float</span> DeltaSeconds)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Super::<span class="built_in">Tick</span>(DeltaSeconds);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (bPendingBindTarget)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="built_in">TryBindTarget</span>();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyMarker::TryBindTarget</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (!<span class="built_in">IsValid</span>(Target))</span><br><span class="line">    &#123;</span><br><span class="line">        bPendingBindTarget = <span class="literal">true</span>;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    bPendingBindTarget = <span class="literal">false</span>;</span><br><span class="line">    Target-&gt;OnDestroyed.<span class="built_in">AddDynamic</span>(<span class="keyword">this</span>, &amp;ThisClass::HandleTargetDestroyed);</span><br><span class="line">    <span class="built_in">RefreshMarkerVisual</span>();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="RPC-参数里的未映射引用更危险"><a href="#RPC-参数里的未映射引用更危险" class="headerlink" title="RPC 参数里的未映射引用更危险"></a>RPC 参数里的未映射引用更危险</h3><p>属性引用可以被后续 remap，但 RPC 参数里的对象引用要更加谨慎。若 RPC 到达时对象还没有映射，某些情况下会以 null 参数执行；是否延迟未映射 RPC 还受 <code>net.DelayUnmappedRPCs</code> 等配置影响。</p>
+<p>所以，不要把关键业务只写成：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">Client_PlayLockOn</span>(TargetActor);</span><br></pre></td></tr></table></figure>
+
+<p>更稳的方式是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">1. 同步 TargetActor 指针。</span><br><span class="line">2. 同步 TargetRuntimeId / GameplayObjectId 作为稳定 ID。</span><br><span class="line">3. 客户端在 TryBindTarget 中等待指针或 ID 解析完成。</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="PlayerState-上-COND-OwnerOnly-的属性会不会同步给非-Owner"><a href="#PlayerState-上-COND-OwnerOnly-的属性会不会同步给非-Owner" class="headerlink" title="PlayerState 上 COND_OwnerOnly 的属性会不会同步给非 Owner"></a>PlayerState 上 COND_OwnerOnly 的属性会不会同步给非 Owner</h2><blockquote>
+<p>PlayerState 上一个复制属性，只设置 <code>COND_OwnerOnly</code>。这个 PlayerState 同步到非 owner 客户端上时，这个属性的初始值会不会同步到其他客户端？会不会触发 OnRep？</p>
+</blockquote>
+<p>结论：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">不会。</span><br></pre></td></tr></table></figure>
+
+<p>更准确地说：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">PlayerState 这个 Actor 本身会同步到所有相关客户端。</span><br><span class="line">但是这个属性带了 COND_OwnerOnly。</span><br><span class="line">对非 Owner 连接来说，该属性在初始复制和后续复制时都会被过滤掉。</span><br><span class="line">所以非 Owner 客户端不会收到它的初始值，也不会因此触发 OnRep。</span><br></pre></td></tr></table></figure>
+
+<h3 id="例子"><a href="#例子" class="headerlink" title="例子"></a>例子</h3><figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UPROPERTY</span>(ReplicatedUsing = OnRep_PrivateInventory)</span><br><span class="line">FInventoryList PrivateInventory;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyPlayerState::GetLifetimeReplicatedProps</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">    TArray&lt;FLifetimeProperty&gt;&amp; OutLifetimeProps</span></span></span><br><span class="line"><span class="params"><span class="function">)</span> <span class="type">const</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Super::<span class="built_in">GetLifetimeReplicatedProps</span>(OutLifetimeProps);</span><br><span class="line"></span><br><span class="line">    <span class="built_in">DOREPLIFETIME_CONDITION</span>(</span><br><span class="line">        AMyPlayerState,</span><br><span class="line">        PrivateInventory,</span><br><span class="line">        COND_OwnerOnly</span><br><span class="line">    );</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>客户端 A 是这个 PlayerState 的 Owner：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">客户端 A：</span><br><span class="line">- 收到 PrivateInventory 初始值</span><br><span class="line">- 后续变化也收到</span><br><span class="line">- OnRep_PrivateInventory 会触发</span><br></pre></td></tr></table></figure>
+
+<p>客户端 B 不是 Owner：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">客户端 B：</span><br><span class="line">- 能看到这个 PlayerState</span><br><span class="line">- 但不会收到 PrivateInventory 初始值</span><br><span class="line">- 后续变化也不会收到</span><br><span class="line">- OnRep_PrivateInventory 不会因为网络复制触发</span><br></pre></td></tr></table></figure>
+
+<p>客户端 B 上这个字段通常只是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">C++ 构造默认值</span><br><span class="line">Blueprint 默认值</span><br><span class="line">本地代码曾经写过的值</span><br></pre></td></tr></table></figure>
+
+<p>但不会是服务端真实值。</p>
+<h3 id="私有数据和公开数据要分开"><a href="#私有数据和公开数据要分开" class="headerlink" title="私有数据和公开数据要分开"></a>私有数据和公开数据要分开</h3><p>推荐：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="comment">// 所有人可见：等级、队伍、击杀数、当前装备外观</span></span><br><span class="line"><span class="built_in">UPROPERTY</span>(ReplicatedUsing = OnRep_PublicStats)</span><br><span class="line">FPublicPlayerStats PublicStats;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 只有自己可见：背包完整内容、任务私密进度、私有 UI 数据</span></span><br><span class="line"><span class="built_in">UPROPERTY</span>(ReplicatedUsing = OnRep_PrivateInventory)</span><br><span class="line">FInventoryList PrivateInventory;</span><br></pre></td></tr></table></figure>
+
+<p>不要在非 Owner 客户端读取 OwnerOnly 字段做 UI 或玩法判断。</p>
+<hr>
+<h2 id="RPC、Client-RPC、NetMulticast-与-Dedicated-Server"><a href="#RPC、Client-RPC、NetMulticast-与-Dedicated-Server" class="headerlink" title="RPC、Client RPC、NetMulticast 与 Dedicated Server"></a>RPC、Client RPC、NetMulticast 与 Dedicated Server</h2><h3 id="Client-RPC-只能发给拥有者"><a href="#Client-RPC-只能发给拥有者" class="headerlink" title="Client RPC 只能发给拥有者"></a>Client RPC 只能发给拥有者</h3><p><code>Client RPC</code> 的目标不是“所有客户端”，而是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">拥有这个 Actor 的那个 UNetConnection</span><br></pre></td></tr></table></figure>
+
+<p>在 Dedicated Server 下：</p>
+<pre class="mermaid">flowchart TB
+    A["Server 调用 Client RPC"]
+    B["UE 查找这个 Actor 的<br/>Owning Connection"]
+    C["只把 RPC 发给该连接<br/>对应的客户端"]
+    A --> B --> C</pre>
+
+<p>例子：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UFUNCTION</span>(Client, Reliable)</span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">Client_ShowInventoryError</span><span class="params">(<span class="type">const</span> FString&amp; Reason)</span></span>;</span><br></pre></td></tr></table></figure>
+
+<p>服务端：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">PlayerAController-&gt;<span class="built_in">Client_ShowInventoryError</span>(<span class="built_in">TEXT</span>(<span class="string">&quot;背包满了&quot;</span>));</span><br></pre></td></tr></table></figure>
+
+<p>结果：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">客户端 A 收到</span><br><span class="line">客户端 B 收不到</span><br><span class="line">客户端 C 收不到</span><br></pre></td></tr></table></figure>
+
+<p>这正是 Client RPC 的用途：<strong>私有通知</strong>。</p>
+<h3 id="如果-Actor-没有-Owning-Connection-呢？"><a href="#如果-Actor-没有-Owning-Connection-呢？" class="headerlink" title="如果 Actor 没有 Owning Connection 呢？"></a>如果 Actor 没有 Owning Connection 呢？</h3><p>如果服务端在一个没有 owning client 的世界 Actor 上调用 Client RPC：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">WorldTipActor-&gt;<span class="built_in">Client_ShowTip</span>();</span><br></pre></td></tr></table></figure>
+
+<p>它不会神奇地发给所有客户端。Client RPC 不是广播。如果想广播，应该使用：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">1. NetMulticast：瞬时表现广播。</span><br><span class="line">2. 复制公开属性：长期公开状态。</span><br><span class="line">3. 遍历 PlayerController 逐个发 Client RPC：每个玩家内容不同的私有通知。</span><br></pre></td></tr></table></figure>
+
+<h3 id="NetMulticast-也不是万能广播"><a href="#NetMulticast-也不是万能广播" class="headerlink" title="NetMulticast 也不是万能广播"></a>NetMulticast 也不是万能广播</h3><p><code>NetMulticast</code> 只有服务端调用时，才会在服务端以及该 Actor 当前 relevant 的客户端执行。</p>
+<p>错误理解：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">Client 调用 Multicast -&gt; 所有人收到</span><br></pre></td></tr></table></figure>
+
+<p>实际：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">Client 调用 Multicast -&gt; 通常只在本地执行</span><br><span class="line">Server 调用 Multicast -&gt; 服务端和相关客户端执行</span><br></pre></td></tr></table></figure>
+
+<p>适合用 NetMulticast 的场景：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">爆炸特效</span><br><span class="line">枪口火焰</span><br><span class="line">普通受击表现</span><br><span class="line">短生命周期表现事件</span><br></pre></td></tr></table></figure>
+
+<p>不适合：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">门是否打开</span><br><span class="line">比赛阶段</span><br><span class="line">玩家是否死亡</span><br><span class="line">建筑等级</span><br><span class="line">背包内容</span><br></pre></td></tr></table></figure>
+
+<p>这些应该用 replicated state。</p>
+<h3 id="Dedicated-Server-没有本地玩家、UI、音频、渲染"><a href="#Dedicated-Server-没有本地玩家、UI、音频、渲染" class="headerlink" title="Dedicated Server 没有本地玩家、UI、音频、渲染"></a>Dedicated Server 没有本地玩家、UI、音频、渲染</h3><p>Dedicated Server 是纯服务端进程：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">没有 LocalPlayer</span><br><span class="line">没有 Viewport</span><br><span class="line">没有 UMG</span><br><span class="line">没有本地输入</span><br><span class="line">没有本地相机</span><br><span class="line">不应该播放音效</span><br><span class="line">不应该渲染 Niagara / 粒子</span><br><span class="line">不应该访问客户端 UI</span><br></pre></td></tr></table></figure>
+
+<p>但它有：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">World</span><br><span class="line">GameMode</span><br><span class="line">GameState</span><br><span class="line">PlayerController（服务端表示远端连接）</span><br><span class="line">PlayerState</span><br><span class="line">Pawn / Character</span><br><span class="line">Actor</span><br><span class="line">NetDriver</span><br></pre></td></tr></table></figure>
+
+<p>错误写法：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::Die</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="built_in">PlayDeathSound</span>();</span><br><span class="line">    <span class="built_in">SpawnDeathNiagara</span>();</span><br><span class="line">    <span class="built_in">ShowDeathUI</span>();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>更安全：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::Die</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (<span class="built_in">HasAuthority</span>())</span><br><span class="line">    &#123;</span><br><span class="line">        bIsDead = <span class="literal">true</span>;</span><br><span class="line">        <span class="built_in">OnRep_IsDead</span>();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::OnRep_IsDead</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (<span class="built_in">GetNetMode</span>() == NM_DedicatedServer)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="built_in">PlayDeathSound</span>();</span><br><span class="line">    <span class="built_in">SpawnDeathNiagara</span>();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (<span class="built_in">IsLocallyControlled</span>())</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="built_in">ShowDeathUI</span>();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="Reliable-RPC-的真实含义：可靠但不是万能"><a href="#Reliable-RPC-的真实含义：可靠但不是万能" class="headerlink" title="Reliable RPC 的真实含义：可靠但不是万能"></a>Reliable RPC 的真实含义：可靠但不是万能</h2><p>Reliable 的含义不是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">一定立刻执行</span><br><span class="line">永远不会失败</span><br><span class="line">网络断了还能到</span><br><span class="line">适合每帧发送</span><br></pre></td></tr></table></figure>
+
+<p>更准确的理解是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">在连接和 Channel 仍然有效的前提下，</span><br><span class="line">Reliable RPC 会被重发直到收到 ACK，</span><br><span class="line">并保证相关范围内的执行顺序。</span><br></pre></td></tr></table></figure>
+
+<h3 id="Reliable-的-Head-of-line-Blocking"><a href="#Reliable-的-Head-of-line-Blocking" class="headerlink" title="Reliable 的 Head-of-line Blocking"></a>Reliable 的 Head-of-line Blocking</h3><p>假设同一个 ActorChannel 上：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">Reliable RPC A 丢包</span><br><span class="line">Reliable RPC B 到了</span><br></pre></td></tr></table></figure>
+
+<p>由于可靠顺序要求，B 不能越过 A 执行。</p>
+<p>结果：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">A 堵住</span><br><span class="line">B 延迟</span><br><span class="line">后续可靠消息继续堆积</span><br></pre></td></tr></table></figure>
+
+<p>所以不要这样：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::Tick</span><span class="params">(<span class="type">float</span> DeltaSeconds)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="built_in">Server_UpdateAimRotation</span>(AimRot);</span><br><span class="line">    <span class="built_in">Server_UpdateMoveInput</span>(Input);</span><br><span class="line">    <span class="built_in">Server_UpdateMouseDelta</span>(MouseDelta);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>如果这些都是 Reliable，高延迟或丢包下很快就会把可靠队列堆起来。</p>
+<h3 id="Reliable-适合什么"><a href="#Reliable-适合什么" class="headerlink" title="Reliable 适合什么"></a>Reliable 适合什么</h3><p>适合：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">背包使用请求</span><br><span class="line">购买物品</span><br><span class="line">聊天消息</span><br><span class="line">确认类 UI 操作</span><br><span class="line">开始匹配</span><br><span class="line">任务领取</span><br><span class="line">关键玩法请求</span><br></pre></td></tr></table></figure>
+
+<p>不适合：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">每帧瞄准</span><br><span class="line">每帧输入</span><br><span class="line">脚步声</span><br><span class="line">普通枪口火焰</span><br><span class="line">普通受击飘字</span><br><span class="line">持续移动状态</span><br><span class="line">大量频繁 UI 提示</span><br></pre></td></tr></table></figure>
+
+<p>建议：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">重要低频请求：Reliable</span><br><span class="line">高频状态：压缩属性 / CharacterMovement / Unreliable 限频</span><br><span class="line">普通表现：Unreliable RPC / 本地预测</span><br></pre></td></tr></table></figure>
+
+<h3 id="Reliable-的顺序边界"><a href="#Reliable-的顺序边界" class="headerlink" title="Reliable 的顺序边界"></a>Reliable 的顺序边界</h3><p>可以依赖：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">同一 Actor 上 Reliable RPC 的相对顺序。</span><br><span class="line">Actor 与其 SubObject 上的 RPC 顺序也有相应保证。</span><br></pre></td></tr></table></figure>
+
+<p>不要依赖：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">不同 Actor 的 RPC 顺序。</span><br><span class="line">Reliable 与 Unreliable 混用时的顺序。</span><br><span class="line">RPC 与其他 Actor 属性复制的顺序。</span><br><span class="line">RPC 与对象引用创建的顺序。</span><br><span class="line">RPC 与 UI 初始化的顺序。</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="Replicated-SubObject：复制-UObject-的正确方式"><a href="#Replicated-SubObject：复制-UObject-的正确方式" class="headerlink" title="Replicated SubObject：复制 UObject 的正确方式"></a>Replicated SubObject：复制 UObject 的正确方式</h2><p>普通 <code>UObject</code> 默认不是独立网络对象。UE 原生网络复制的主角是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">AActor</span><br><span class="line">UActorComponent</span><br><span class="line">ActorChannel</span><br></pre></td></tr></table></figure>
+
+<p>但玩法系统经常需要轻量对象：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">背包对象 UInventoryObject</span><br><span class="line">技能对象 UAbilityInstance</span><br><span class="line">Buff 对象 UBuffInstance</span><br><span class="line">任务对象 UQuestState</span><br><span class="line">装备槽 UObject</span><br><span class="line">UGC 脚本实例 UObject</span><br></pre></td></tr></table></figure>
+
+<p>如果每个都做成 Actor，成本很高。SubObject 的意义就是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">把 UObject 作为某个 Actor 或 ActorComponent 的 replicated subobject 复制。</span><br><span class="line">SubObject 没有自己的 ActorChannel。</span><br><span class="line">SubObject 通过 Owning Actor 的 ActorChannel 复制。</span><br><span class="line">SubObject 可以有自己的 replicated properties。</span><br></pre></td></tr></table></figure>
+
+<h3 id="复制引用和复制对象本体是两件事"><a href="#复制引用和复制对象本体是两件事" class="headerlink" title="复制引用和复制对象本体是两件事"></a>复制引用和复制对象本体是两件事</h3><p>这是 SubObject 最容易错的点。</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UPROPERTY</span>(Replicated)</span><br><span class="line">TObjectPtr&lt;UInventoryObject&gt; InventoryObject;</span><br></pre></td></tr></table></figure>
+
+<p>这只是复制“指向它的引用”。它不等于复制这个 UObject 本体。</p>
+<p>如果对象本体没有通过：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">AddReplicatedSubObject</span><br></pre></td></tr></table></figure>
+
+<p>或旧路径：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">ReplicateSubobjects / Channel-&gt;ReplicateSubobject</span><br></pre></td></tr></table></figure>
+
+<p>注册进入复制流程，客户端不会自动拥有它的完整复制状态。</p>
+<h3 id="UObject-自身需要支持网络"><a href="#UObject-自身需要支持网络" class="headerlink" title="UObject 自身需要支持网络"></a>UObject 自身需要支持网络</h3><figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UCLASS</span>()</span><br><span class="line"><span class="keyword">class</span> <span class="title class_">UInventoryObject</span> : <span class="keyword">public</span> UObject</span><br><span class="line">&#123;</span><br><span class="line">    <span class="built_in">GENERATED_BODY</span>()</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span>:</span><br><span class="line">    <span class="function"><span class="keyword">virtual</span> <span class="type">bool</span> <span class="title">IsSupportedForNetworking</span><span class="params">()</span> <span class="type">const</span> <span class="keyword">override</span></span></span><br><span class="line"><span class="function">    </span>&#123;</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="keyword">virtual</span> <span class="type">void</span> <span class="title">GetLifetimeReplicatedProps</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">        TArray&lt;FLifetimeProperty&gt;&amp; OutLifetimeProps</span></span></span><br><span class="line"><span class="params"><span class="function">    )</span> <span class="type">const</span> <span class="keyword">override</span></span>;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span>:</span><br><span class="line">    <span class="built_in">UPROPERTY</span>(ReplicatedUsing = OnRep_Items)</span><br><span class="line">    FInventoryFastArray Items;</span><br><span class="line"></span><br><span class="line">    <span class="built_in">UFUNCTION</span>()</span><br><span class="line">    <span class="function"><span class="type">void</span> <span class="title">OnRep_Items</span><span class="params">()</span></span>;</span><br><span class="line">&#125;;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">UInventoryObject::GetLifetimeReplicatedProps</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">    TArray&lt;FLifetimeProperty&gt;&amp; OutLifetimeProps</span></span></span><br><span class="line"><span class="params"><span class="function">)</span> <span class="type">const</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Super::<span class="built_in">GetLifetimeReplicatedProps</span>(OutLifetimeProps);</span><br><span class="line">    <span class="built_in">DOREPLIFETIME</span>(UInventoryObject, Items);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="UE5-推荐：Registered-SubObject-List"><a href="#UE5-推荐：Registered-SubObject-List" class="headerlink" title="UE5 推荐：Registered SubObject List"></a>UE5 推荐：Registered SubObject List</h3><figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UCLASS</span>()</span><br><span class="line"><span class="keyword">class</span> <span class="title class_">AMyPlayerState</span> : <span class="keyword">public</span> APlayerState</span><br><span class="line">&#123;</span><br><span class="line">    <span class="built_in">GENERATED_BODY</span>()</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span>:</span><br><span class="line">    <span class="built_in">AMyPlayerState</span>();</span><br><span class="line"></span><br><span class="line">    <span class="built_in">UPROPERTY</span>(ReplicatedUsing = OnRep_InventoryObject)</span><br><span class="line">    TObjectPtr&lt;UInventoryObject&gt; InventoryObject;</span><br><span class="line"></span><br><span class="line">    <span class="built_in">UFUNCTION</span>()</span><br><span class="line">    <span class="function"><span class="type">void</span> <span class="title">OnRep_InventoryObject</span><span class="params">()</span></span>;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="keyword">virtual</span> <span class="type">void</span> <span class="title">GetLifetimeReplicatedProps</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">        TArray&lt;FLifetimeProperty&gt;&amp; OutLifetimeProps</span></span></span><br><span class="line"><span class="params"><span class="function">    )</span> <span class="type">const</span> <span class="keyword">override</span></span>;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="type">void</span> <span class="title">CreateInventoryOnServer</span><span class="params">()</span></span>;</span><br><span class="line">    <span class="function"><span class="type">void</span> <span class="title">DestroyInventoryOnServer</span><span class="params">()</span></span>;</span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<p>实现：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">AMyPlayerState::<span class="built_in">AMyPlayerState</span>()</span><br><span class="line">&#123;</span><br><span class="line">    bReplicates = <span class="literal">true</span>;</span><br><span class="line">    bReplicateUsingRegisteredSubObjectList = <span class="literal">true</span>;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyPlayerState::CreateInventoryOnServer</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (!<span class="built_in">HasAuthority</span>())</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (<span class="built_in">IsValid</span>(InventoryObject))</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="built_in">RemoveReplicatedSubObject</span>(InventoryObject);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    InventoryObject = <span class="built_in">NewObject</span>&lt;UInventoryObject&gt;(<span class="keyword">this</span>);</span><br><span class="line">    <span class="built_in">AddReplicatedSubObject</span>(InventoryObject);</span><br><span class="line"></span><br><span class="line">    <span class="built_in">ForceNetUpdate</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyPlayerState::DestroyInventoryOnServer</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (!<span class="built_in">HasAuthority</span>())</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (<span class="built_in">IsValid</span>(InventoryObject))</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="built_in">RemoveReplicatedSubObject</span>(InventoryObject);</span><br><span class="line">        InventoryObject = <span class="literal">nullptr</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="built_in">ForceNetUpdate</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyPlayerState::GetLifetimeReplicatedProps</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">    TArray&lt;FLifetimeProperty&gt;&amp; OutLifetimeProps</span></span></span><br><span class="line"><span class="params"><span class="function">)</span> <span class="type">const</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Super::<span class="built_in">GetLifetimeReplicatedProps</span>(OutLifetimeProps);</span><br><span class="line">    <span class="built_in">DOREPLIFETIME</span>(AMyPlayerState, InventoryObject);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意：<strong>删除或替换已经注册的 SubObject 前，先 <code>RemoveReplicatedSubObject</code>。</strong> 注册列表里保留的是原始指针，忘记移除后再 GC，可能造成悬空指针或崩溃。</p>
+<h3 id="UE4-兼容路径：ReplicateSubobjects"><a href="#UE4-兼容路径：ReplicateSubobjects" class="headerlink" title="UE4&#x2F;兼容路径：ReplicateSubobjects"></a>UE4&#x2F;兼容路径：ReplicateSubobjects</h3><figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">bool</span> <span class="title">AMyPlayerState::ReplicateSubobjects</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">    UActorChannel* Channel,</span></span></span><br><span class="line"><span class="params"><span class="function">    FOutBunch* Bunch,</span></span></span><br><span class="line"><span class="params"><span class="function">    FReplicationFlags* RepFlags</span></span></span><br><span class="line"><span class="params"><span class="function">)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="type">bool</span> bWroteSomething = Super::<span class="built_in">ReplicateSubobjects</span>(Channel, Bunch, RepFlags);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (<span class="built_in">IsValid</span>(InventoryObject))</span><br><span class="line">    &#123;</span><br><span class="line">        bWroteSomething |= Channel-&gt;<span class="built_in">ReplicateSubobject</span>(</span><br><span class="line">            InventoryObject,</span><br><span class="line">            *Bunch,</span><br><span class="line">            *RepFlags</span><br><span class="line">        );</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">return</span> bWroteSomething;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>UE5 Generic Replication &#x2F; ReplicationGraph 仍可用这条兼容路径，但 Iris 只支持 registered subobject list。所以新项目建议优先走 registered list。</p>
+<h3 id="SubObject-RPC-要额外处理"><a href="#SubObject-RPC-要额外处理" class="headerlink" title="SubObject RPC 要额外处理"></a>SubObject RPC 要额外处理</h3><p>Replicated SubObject 默认不等于“UObject RPC 自动可用”。如果 SubObject 需要自己发 RPC，通常要重写：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="keyword">virtual</span> int32 <span class="title">GetFunctionCallspace</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">    UFunction* Function,</span></span></span><br><span class="line"><span class="params"><span class="function">    FFrame* Stack</span></span></span><br><span class="line"><span class="params"><span class="function">)</span> <span class="keyword">override</span></span>;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="keyword">virtual</span> <span class="type">bool</span> <span class="title">CallRemoteFunction</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">    UFunction* Function,</span></span></span><br><span class="line"><span class="params"><span class="function">    <span class="type">void</span>* Parms,</span></span></span><br><span class="line"><span class="params"><span class="function">    FOutParmRec* OutParms,</span></span></span><br><span class="line"><span class="params"><span class="function">    FFrame* Stack</span></span></span><br><span class="line"><span class="params"><span class="function">)</span> <span class="keyword">override</span></span>;</span><br></pre></td></tr></table></figure>
+
+<p>简单项目里更推荐：<strong>SubObject 不直接发 RPC，通过 Owner Actor &#x2F; Component 转发。</strong></p>
+<hr>
+<h2 id="FastArray：列表型状态的增量同步"><a href="#FastArray：列表型状态的增量同步" class="headerlink" title="FastArray：列表型状态的增量同步"></a>FastArray：列表型状态的增量同步</h2><p>普通 <code>TArray</code> 复制的问题：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UPROPERTY</span>(ReplicatedUsing = OnRep_Items)</span><br><span class="line">TArray&lt;FInventoryItem&gt; Items;</span><br></pre></td></tr></table></figure>
+
+<p>如果数组有 100 个元素，只改了 1 个：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">普通数组复制可能造成较大带宽浪费。</span><br><span class="line">客户端也不知道哪个元素是新增、删除、修改。</span><br><span class="line">OnRep_Items 只能拿到最终数组。</span><br></pre></td></tr></table></figure>
+
+<p>FastArray 的目标是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">只同步变化的元素。</span><br><span class="line">让客户端知道哪些元素 Added / Changed / Removed。</span><br><span class="line">适合背包、Buff、技能、任务、状态列表。</span><br></pre></td></tr></table></figure>
+
+<h3 id="基本结构"><a href="#基本结构" class="headerlink" title="基本结构"></a>基本结构</h3><p>Item：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">USTRUCT</span>()</span><br><span class="line"><span class="keyword">struct</span> <span class="title class_">FInventoryItemEntry</span> : <span class="keyword">public</span> FFastArraySerializerItem</span><br><span class="line">&#123;</span><br><span class="line">    <span class="built_in">GENERATED_BODY</span>()</span><br><span class="line"></span><br><span class="line">    <span class="built_in">UPROPERTY</span>()</span><br><span class="line">    int32 SlotIndex = INDEX_NONE;</span><br><span class="line"></span><br><span class="line">    <span class="built_in">UPROPERTY</span>()</span><br><span class="line">    int32 ItemId = <span class="number">0</span>;</span><br><span class="line"></span><br><span class="line">    <span class="built_in">UPROPERTY</span>()</span><br><span class="line">    int32 Count = <span class="number">0</span>;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="type">void</span> <span class="title">PreReplicatedRemove</span><span class="params">(<span class="type">const</span> <span class="keyword">struct</span> FInventoryList&amp; InArraySerializer)</span></span>;</span><br><span class="line">    <span class="function"><span class="type">void</span> <span class="title">PostReplicatedAdd</span><span class="params">(<span class="type">const</span> <span class="keyword">struct</span> FInventoryList&amp; InArraySerializer)</span></span>;</span><br><span class="line">    <span class="function"><span class="type">void</span> <span class="title">PostReplicatedChange</span><span class="params">(<span class="type">const</span> <span class="keyword">struct</span> FInventoryList&amp; InArraySerializer)</span></span>;</span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<p>Container：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">USTRUCT</span>()</span><br><span class="line"><span class="keyword">struct</span> <span class="title class_">FInventoryList</span> : <span class="keyword">public</span> FFastArraySerializer</span><br><span class="line">&#123;</span><br><span class="line">    <span class="built_in">GENERATED_BODY</span>()</span><br><span class="line"></span><br><span class="line">    <span class="built_in">UPROPERTY</span>()</span><br><span class="line">    TArray&lt;FInventoryItemEntry&gt; Entries;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="type">bool</span> <span class="title">NetDeltaSerialize</span><span class="params">(FNetDeltaSerializeInfo&amp; DeltaParms)</span></span></span><br><span class="line"><span class="function">    </span>&#123;</span><br><span class="line">        <span class="keyword">return</span> FFastArraySerializer::<span class="built_in">FastArrayDeltaSerialize</span>&lt;</span><br><span class="line">            FInventoryItemEntry,</span><br><span class="line">            FInventoryList</span><br><span class="line">        &gt;(Entries, DeltaParms, *<span class="keyword">this</span>);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="type">void</span> <span class="title">AddItem</span><span class="params">(int32 SlotIndex, int32 ItemId, int32 Count)</span></span></span><br><span class="line"><span class="function">    </span>&#123;</span><br><span class="line">        FInventoryItemEntry&amp; Entry = Entries.<span class="built_in">AddDefaulted_GetRef</span>();</span><br><span class="line">        Entry.SlotIndex = SlotIndex;</span><br><span class="line">        Entry.ItemId = ItemId;</span><br><span class="line">        Entry.Count = Count;</span><br><span class="line"></span><br><span class="line">        <span class="built_in">MarkItemDirty</span>(Entry);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="type">void</span> <span class="title">ChangeCount</span><span class="params">(int32 SlotIndex, int32 NewCount)</span></span></span><br><span class="line"><span class="function">    </span>&#123;</span><br><span class="line">        <span class="keyword">if</span> (FInventoryItemEntry* Entry = <span class="built_in">FindBySlot</span>(SlotIndex))</span><br><span class="line">        &#123;</span><br><span class="line">            Entry-&gt;Count = NewCount;</span><br><span class="line">            <span class="built_in">MarkItemDirty</span>(*Entry);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="type">void</span> <span class="title">RemoveAtIndex</span><span class="params">(int32 Index)</span></span></span><br><span class="line"><span class="function">    </span>&#123;</span><br><span class="line">        Entries.<span class="built_in">RemoveAt</span>(Index);</span><br><span class="line">        <span class="built_in">MarkArrayDirty</span>();</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="function">FInventoryItemEntry* <span class="title">FindBySlot</span><span class="params">(int32 SlotIndex)</span></span></span><br><span class="line"><span class="function">    </span>&#123;</span><br><span class="line">        <span class="keyword">return</span> Entries.<span class="built_in">FindByPredicate</span>(</span><br><span class="line">            [SlotIndex](<span class="type">const</span> FInventoryItemEntry&amp; Entry)</span><br><span class="line">            &#123;</span><br><span class="line">                <span class="keyword">return</span> Entry.SlotIndex == SlotIndex;</span><br><span class="line">            &#125;</span><br><span class="line">        );</span><br><span class="line">    &#125;</span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<p>Traits：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="keyword">template</span>&lt;&gt;</span><br><span class="line"><span class="keyword">struct</span> <span class="title class_">TStructOpsTypeTraits</span>&lt;FInventoryList&gt;</span><br><span class="line">    : <span class="keyword">public</span> TStructOpsTypeTraitsBase2&lt;FInventoryList&gt;</span><br><span class="line">&#123;</span><br><span class="line">    <span class="keyword">enum</span></span><br><span class="line">    &#123;</span><br><span class="line">        WithNetDeltaSerializer = <span class="literal">true</span></span><br><span class="line">    &#125;;</span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<p>Owner：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UPROPERTY</span>(Replicated)</span><br><span class="line">FInventoryList InventoryList;</span><br></pre></td></tr></table></figure>
+
+<h3 id="FastArray-的本质"><a href="#FastArray-的本质" class="headerlink" title="FastArray 的本质"></a>FastArray 的本质</h3><p>FastArray 不是“魔法数组”，它的本质是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">每个连接维护一份上次发送 / 接收状态。</span><br><span class="line">服务端对数组元素做版本追踪。</span><br><span class="line">本次只序列化变化的元素和删除信息。</span><br><span class="line">客户端按 ReplicationID 合并到本地数组。</span><br></pre></td></tr></table></figure>
+
+<p>可以类比：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">普通 TArray：发整张表。</span><br><span class="line">FastArray：发变更日志。</span><br></pre></td></tr></table></figure>
+
+<h3 id="必须-Mark-Dirty"><a href="#必须-Mark-Dirty" class="headerlink" title="必须 Mark Dirty"></a>必须 Mark Dirty</h3><p>新增或修改元素：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">Entry.Count += <span class="number">1</span>;</span><br><span class="line"><span class="built_in">MarkItemDirty</span>(Entry);</span><br></pre></td></tr></table></figure>
+
+<p>删除元素：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">Entries.<span class="built_in">RemoveAt</span>(Index);</span><br><span class="line"><span class="built_in">MarkArrayDirty</span>();</span><br></pre></td></tr></table></figure>
+
+<p>这不是风格问题，而是 FastArray 增量复制能否正确生效的前提。</p>
+<h3 id="不要把数组下标当稳定身份"><a href="#不要把数组下标当稳定身份" class="headerlink" title="不要把数组下标当稳定身份"></a>不要把数组下标当稳定身份</h3><p>不要依赖：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">Entries[<span class="number">3</span>]</span><br></pre></td></tr></table></figure>
+
+<p>作为长期身份。更稳的是显式存：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">int32 SlotIndex;</span><br><span class="line">FGuid ItemGuid;</span><br></pre></td></tr></table></figure>
+
+<p>FastArray 依赖 <code>ReplicationID</code> 做元素身份，业务层也应该有自己的稳定 ID。</p>
+<hr>
+<h2 id="网络同步顺序不要过度假设"><a href="#网络同步顺序不要过度假设" class="headerlink" title="网络同步顺序不要过度假设"></a>网络同步顺序不要过度假设</h2><p>常见错误假设：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">服务端先设置属性，再发 RPC，客户端一定先收到属性。</span><br><span class="line">Actor A 先 Spawn，Actor B 后 Spawn，客户端一定先收到 A。</span><br><span class="line">Target 指针 OnRep 时，Target Actor 一定已经创建。</span><br><span class="line">BeginPlay 后所有 replicated 属性都可用。</span><br><span class="line">多个 OnRep 按声明顺序触发。</span><br></pre></td></tr></table></figure>
+
+<p>这些都不能作为强业务前提。</p>
+<h3 id="典型错误代码"><a href="#典型错误代码" class="headerlink" title="典型错误代码"></a>典型错误代码</h3><p>服务端：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">CurrentWeapon = NewWeapon;</span><br><span class="line"><span class="built_in">Client_PlayEquipAnimation</span>();</span><br></pre></td></tr></table></figure>
+
+<p>客户端：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::Client_PlayEquipAnimation_Implementation</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    CurrentWeapon-&gt;<span class="built_in">AttachToComponent</span>(<span class="built_in">GetMesh</span>(), AttachRules, SocketName);</span><br><span class="line">    <span class="built_in">PlayAnimMontage</span>(CurrentWeapon-&gt;EquipMontage);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>风险：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">Client RPC 先执行。</span><br><span class="line">CurrentWeapon 属性还没更新。</span><br><span class="line">或者 NewWeapon Actor 还没创建。</span><br><span class="line">于是 CurrentWeapon == nullptr。</span><br></pre></td></tr></table></figure>
+
+<h3 id="稳定写法：事件-ID-状态收敛"><a href="#稳定写法：事件-ID-状态收敛" class="headerlink" title="稳定写法：事件 ID + 状态收敛"></a>稳定写法：事件 ID + 状态收敛</h3><p>服务端：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">CurrentWeapon = NewWeapon;</span><br><span class="line">EquipEventId++;</span><br></pre></td></tr></table></figure>
+
+<p>客户端：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::OnRep_CurrentWeapon</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="built_in">TryPlayEquip</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::OnRep_EquipEventId</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    bPendingEquipEvent = <span class="literal">true</span>;</span><br><span class="line">    <span class="built_in">TryPlayEquip</span>();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::TryPlayEquip</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (!bPendingEquipEvent)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (!<span class="built_in">IsValid</span>(CurrentWeapon))</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (!<span class="built_in">GetMesh</span>())</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    bPendingEquipEvent = <span class="literal">false</span>;</span><br><span class="line">    <span class="built_in">AttachWeapon</span>();</span><br><span class="line">    <span class="built_in">PlayEquipMontage</span>();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>核心思想：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">不要依赖“网络消息到达顺序”。</span><br><span class="line">依赖“条件满足后执行”。</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="大量-Actor-同步为什么会爆性能"><a href="#大量-Actor-同步为什么会爆性能" class="headerlink" title="大量 Actor 同步为什么会爆性能"></a>大量 Actor 同步为什么会爆性能</h2><p>如果有：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">5000 个建筑</span><br><span class="line">2000 个资源点</span><br><span class="line">500 个 NPC</span><br><span class="line">10000 个掉落物</span><br><span class="line">100 个玩家</span><br></pre></td></tr></table></figure>
+
+<p>并且每个 Actor 都：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">bReplicates = <span class="literal">true</span>;</span><br><span class="line">bAlwaysRelevant = <span class="literal">true</span>;</span><br><span class="line">NetUpdateFrequency = <span class="number">100.f</span>;</span><br></pre></td></tr></table></figure>
+
+<p>服务器每帧可能要做：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">每个连接遍历大量 Actor。</span><br><span class="line">判断 relevancy。</span><br><span class="line">判断优先级。</span><br><span class="line">比较属性 dirty。</span><br><span class="line">序列化数据。</span><br><span class="line">维护 ActorChannel。</span><br><span class="line">发包。</span><br></pre></td></tr></table></figure>
+
+<p>复杂度接近：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">Actor 数量 × 连接数量</span><br></pre></td></tr></table></figure>
+
+<p>爆的不是只有带宽，还有：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">服务器 CPU</span><br><span class="line">连接上的 ActorChannel 数量</span><br><span class="line">每连接复制状态缓存</span><br><span class="line">包大小</span><br><span class="line">客户端反序列化成本</span><br></pre></td></tr></table></figure>
+
+<h3 id="生存-UGC-建造类游戏的对象分层"><a href="#生存-UGC-建造类游戏的对象分层" class="headerlink" title="生存 &#x2F; UGC &#x2F; 建造类游戏的对象分层"></a>生存 &#x2F; UGC &#x2F; 建造类游戏的对象分层</h3><table>
+<thead>
+<tr>
+<th>对象类型</th>
+<th>推荐策略</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>玩家角色</td>
+<td>正常复制，高优先级，移动交给 CharacterMovement</td>
+</tr>
+<tr>
+<td>NPC</td>
+<td>距离相关，远处低频或聚合</td>
+</tr>
+<tr>
+<td>建筑</td>
+<td>大部分时间 Dormant，状态变化时唤醒</td>
+</tr>
+<tr>
+<td>资源箱 &#x2F; 采集物</td>
+<td>默认休眠，只同步剩余量、是否被采集、刷新时间</td>
+</tr>
+<tr>
+<td>掉落物</td>
+<td>距离相关，数量多时聚合</td>
+</tr>
+<tr>
+<td>纯装饰</td>
+<td>不复制，客户端根据地图数据或种子本地生成</td>
+</tr>
+</tbody></table>
+<h3 id="常用优化手段"><a href="#常用优化手段" class="headerlink" title="常用优化手段"></a>常用优化手段</h3><figure class="highlight text"><table><tr><td class="code"><pre><span class="line">NetCullDistanceSquared：距离裁剪。</span><br><span class="line">NetUpdateFrequency：降低低频对象更新。</span><br><span class="line">Dormancy：静态对象休眠。</span><br><span class="line">bOnlyRelevantToOwner：私有对象只给 Owner。</span><br><span class="line">COND_OwnerOnly：私有属性只给 Owner。</span><br><span class="line">ReplicationGraph：大规模 Actor 分区。</span><br><span class="line">FastArray：列表增量同步。</span><br><span class="line">SubObject：减少不必要的 Actor 数量。</span><br><span class="line">聚合复制：多个对象合成一个状态包。</span><br><span class="line">客户端预测 / 本地生成表现。</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="ReplicationGraph-原理与实现方法"><a href="#ReplicationGraph-原理与实现方法" class="headerlink" title="ReplicationGraph 原理与实现方法"></a>ReplicationGraph 原理与实现方法</h2><p>传统复制大致是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">对每个连接</span><br><span class="line">    遍历大量 Actor</span><br><span class="line">        判断这个 Actor 是否应该复制给这个连接</span><br></pre></td></tr></table></figure>
+
+<p>大量 Actor + 大量连接时，这会让服务器 CPU 成为瓶颈。</p>
+<p>ReplicationGraph 的思想是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">用持久化节点提前组织 Actor。</span><br><span class="line">每个连接按需从节点拿“候选复制列表”。</span><br><span class="line">避免每帧每连接从零开始遍历所有 Actor。</span><br></pre></td></tr></table></figure>
+
+<h3 id="ReplicationGraph-不是替代属性复制-RPC"><a href="#ReplicationGraph-不是替代属性复制-RPC" class="headerlink" title="ReplicationGraph 不是替代属性复制 &#x2F; RPC"></a>ReplicationGraph 不是替代属性复制 &#x2F; RPC</h3><p>ReplicationGraph 主要优化的是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">“哪些 Actor 需要考虑复制给这个连接”</span><br></pre></td></tr></table></figure>
+
+<p>它不是替代：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">属性复制</span><br><span class="line">RPC</span><br><span class="line">FastArray</span><br><span class="line">SubObject</span><br><span class="line">ActorChannel</span><br></pre></td></tr></table></figure>
+
+<h3 id="常见节点划分"><a href="#常见节点划分" class="headerlink" title="常见节点划分"></a>常见节点划分</h3><figure class="highlight text"><table><tr><td class="code"><pre><span class="line">全局状态 Actor</span><br><span class="line">    -&gt; AlwaysRelevantNode</span><br><span class="line"></span><br><span class="line">PlayerController / PlayerState / 自己 Pawn</span><br><span class="line">    -&gt; AlwaysRelevantForConnectionNode</span><br><span class="line"></span><br><span class="line">玩家角色 / NPC / 掉落物 / 建筑</span><br><span class="line">    -&gt; GridSpatialization2DNode</span><br><span class="line"></span><br><span class="line">只给 Owner 的对象</span><br><span class="line">    -&gt; Owner 相关节点 / bOnlyRelevantToOwner</span><br><span class="line"></span><br><span class="line">休眠静态对象</span><br><span class="line">    -&gt; DormancyNode / Grid + Dormancy</span><br></pre></td></tr></table></figure>
+
+<h3 id="启用-ReplicationGraph"><a href="#启用-ReplicationGraph" class="headerlink" title="启用 ReplicationGraph"></a>启用 ReplicationGraph</h3><p><code>DefaultEngine.ini</code>：</p>
+<figure class="highlight ini"><table><tr><td class="code"><pre><span class="line"><span class="section">[/Script/OnlineSubsystemUtils.IpNetDriver]</span></span><br><span class="line"><span class="attr">ReplicationDriverClassName</span>=<span class="string">&quot;/Script/MyGame.MyReplicationGraph&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>或者用代码绑定：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">UReplicationDriver::<span class="built_in">CreateReplicationDriverDelegate</span>().<span class="built_in">BindLambda</span>(</span><br><span class="line">    [](UNetDriver* ForNetDriver, <span class="type">const</span> FURL&amp; URL, UWorld* World) -&gt; UReplicationDriver*</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span> <span class="built_in">NewObject</span>&lt;UMyReplicationGraph&gt;(<span class="built_in">GetTransientPackage</span>());</span><br><span class="line">    &#125;</span><br><span class="line">);</span><br></pre></td></tr></table></figure>
+
+<h3 id="基础结构"><a href="#基础结构" class="headerlink" title="基础结构"></a>基础结构</h3><figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UCLASS</span>(Transient, Config = Engine)</span><br><span class="line"><span class="keyword">class</span> <span class="title class_">UMyReplicationGraph</span> : <span class="keyword">public</span> UReplicationGraph</span><br><span class="line">&#123;</span><br><span class="line">    <span class="built_in">GENERATED_BODY</span>()</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span>:</span><br><span class="line">    <span class="function"><span class="keyword">virtual</span> <span class="type">void</span> <span class="title">InitGlobalActorClassSettings</span><span class="params">()</span> <span class="keyword">override</span></span>;</span><br><span class="line">    <span class="function"><span class="keyword">virtual</span> <span class="type">void</span> <span class="title">InitGlobalGraphNodes</span><span class="params">()</span> <span class="keyword">override</span></span>;</span><br><span class="line">    <span class="function"><span class="keyword">virtual</span> <span class="type">void</span> <span class="title">InitConnectionGraphNodes</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">        UNetReplicationGraphConnection* RepGraphConnection</span></span></span><br><span class="line"><span class="params"><span class="function">    )</span> <span class="keyword">override</span></span>;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="keyword">virtual</span> <span class="type">void</span> <span class="title">RouteAddNetworkActorToNodes</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">        <span class="type">const</span> FNewReplicatedActorInfo&amp; ActorInfo,</span></span></span><br><span class="line"><span class="params"><span class="function">        FGlobalActorReplicationInfo&amp; GlobalInfo</span></span></span><br><span class="line"><span class="params"><span class="function">    )</span> <span class="keyword">override</span></span>;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="keyword">virtual</span> <span class="type">void</span> <span class="title">RouteRemoveNetworkActorToNodes</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">        <span class="type">const</span> FNewReplicatedActorInfo&amp; ActorInfo</span></span></span><br><span class="line"><span class="params"><span class="function">    )</span> <span class="keyword">override</span></span>;</span><br><span class="line"></span><br><span class="line"><span class="keyword">private</span>:</span><br><span class="line">    <span class="built_in">UPROPERTY</span>()</span><br><span class="line">    TObjectPtr&lt;UReplicationGraphNode_GridSpatialization2D&gt; GridNode;</span><br><span class="line"></span><br><span class="line">    <span class="built_in">UPROPERTY</span>()</span><br><span class="line">    TObjectPtr&lt;UReplicationGraphNode_ActorList&gt; AlwaysRelevantNode;</span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<p>初始化节点：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">UMyReplicationGraph::InitGlobalGraphNodes</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    GridNode = <span class="built_in">CreateNewNode</span>&lt;UReplicationGraphNode_GridSpatialization2D&gt;();</span><br><span class="line">    <span class="built_in">AddGlobalGraphNode</span>(GridNode);</span><br><span class="line"></span><br><span class="line">    AlwaysRelevantNode = <span class="built_in">CreateNewNode</span>&lt;UReplicationGraphNode_ActorList&gt;();</span><br><span class="line">    <span class="built_in">AddGlobalGraphNode</span>(AlwaysRelevantNode);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>路由 Actor：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">UMyReplicationGraph::RouteAddNetworkActorToNodes</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">    <span class="type">const</span> FNewReplicatedActorInfo&amp; ActorInfo,</span></span></span><br><span class="line"><span class="params"><span class="function">    FGlobalActorReplicationInfo&amp; GlobalInfo</span></span></span><br><span class="line"><span class="params"><span class="function">)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    AActor* Actor = ActorInfo.Actor;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (Actor-&gt;<span class="built_in">IsA</span>&lt;AMyGlobalStateActor&gt;())</span><br><span class="line">    &#123;</span><br><span class="line">        AlwaysRelevantNode-&gt;<span class="built_in">NotifyAddNetworkActor</span>(ActorInfo);</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (Actor-&gt;<span class="built_in">IsA</span>&lt;APlayerController&gt;())</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="comment">// 通常不放全局节点，走连接私有逻辑。</span></span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    GridNode-&gt;<span class="built_in">AddActor_Dormancy</span>(ActorInfo, GlobalInfo);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="ReplicationGraph-和-Iris-的关系"><a href="#ReplicationGraph-和-Iris-的关系" class="headerlink" title="ReplicationGraph 和 Iris 的关系"></a>ReplicationGraph 和 Iris 的关系</h3><p>需要特别注意：<strong>ReplicationGraph 和 Iris 是两套独立系统，不是叠加关系。</strong> 一个 NetDriver 不能同时把 ReplicationGraph 当作传统复制筛选层、又使用 Iris 作为同一路复制系统的替代实现。是否启用 Iris、是否使用 ReplicationGraph，需要按项目版本和目标平台统一规划。</p>
+<hr>
+<h2 id="Actor-网络复制调用栈：属性、RPC、OnRep-到底怎么走"><a href="#Actor-网络复制调用栈：属性、RPC、OnRep-到底怎么走" class="headerlink" title="Actor 网络复制调用栈：属性、RPC、OnRep 到底怎么走"></a>Actor 网络复制调用栈：属性、RPC、OnRep 到底怎么走</h2><h3 id="服务端发送路径"><a href="#服务端发送路径" class="headerlink" title="服务端发送路径"></a>服务端发送路径</h3><p>简化调用栈：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">UWorld::Tick</span><br><span class="line">    ↓</span><br><span class="line">UNetDriver::TickFlush</span><br><span class="line">    ↓</span><br><span class="line">UNetDriver::ServerReplicateActors</span><br><span class="line">    ↓</span><br><span class="line">按连接遍历 UNetConnection</span><br><span class="line">    ↓</span><br><span class="line">收集该连接需要复制的 Actor</span><br><span class="line">    ↓</span><br><span class="line">如果使用 ReplicationGraph：</span><br><span class="line">        UReplicationGraph::ServerReplicateActors</span><br><span class="line">        GatherActorListsForConnection</span><br><span class="line">    ↓</span><br><span class="line">找到 / 创建 UActorChannel</span><br><span class="line">    ↓</span><br><span class="line">UActorChannel::ReplicateActor</span><br><span class="line">    ↓</span><br><span class="line">AActor::PreReplication</span><br><span class="line">    ↓</span><br><span class="line">FObjectReplicator::ReplicateProperties</span><br><span class="line">    ↓</span><br><span class="line">复制 Actor 属性</span><br><span class="line">    ↓</span><br><span class="line">复制 Component 属性</span><br><span class="line">    ↓</span><br><span class="line">复制 SubObject 属性</span><br><span class="line">    ↓</span><br><span class="line">发送 RPC / queued RPC bunch</span><br><span class="line">    ↓</span><br><span class="line">UNetConnection Flush</span><br><span class="line">    ↓</span><br><span class="line">Socket send</span><br></pre></td></tr></table></figure>
+
+<p>不同 UE 版本函数名和内部拆分会有差异，但主路径基本是：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">TickFlush -&gt; ServerReplicateActors -&gt; UActorChannel::ReplicateActor</span><br></pre></td></tr></table></figure>
+
+<h3 id="TickDispatch-和-TickFlush"><a href="#TickDispatch-和-TickFlush" class="headerlink" title="TickDispatch 和 TickFlush"></a>TickDispatch 和 TickFlush</h3><p>可以简化理解：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">TickDispatch：收包，处理远端发来的 packet。</span><br><span class="line">TickFlush：发包，把本帧要复制的 Actor/RPC flush 出去。</span><br></pre></td></tr></table></figure>
+
+<p>服务器：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">TickDispatch</span><br><span class="line">    处理客户端输入 / Server RPC</span><br><span class="line"></span><br><span class="line">World Tick</span><br><span class="line">    运行业务逻辑，修改权威状态</span><br><span class="line"></span><br><span class="line">TickFlush</span><br><span class="line">    复制 Actor 属性 / RPC 给客户端</span><br></pre></td></tr></table></figure>
+
+<p>客户端：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">TickDispatch</span><br><span class="line">    接收服务端复制</span><br><span class="line">    创建 Actor</span><br><span class="line">    执行 RPC</span><br><span class="line">    写入属性</span><br><span class="line">    触发 OnRep</span><br><span class="line"></span><br><span class="line">World Tick</span><br><span class="line">    客户端表现 / 预测 / UI</span><br></pre></td></tr></table></figure>
+
+<h3 id="属性复制流程"><a href="#属性复制流程" class="headerlink" title="属性复制流程"></a>属性复制流程</h3><p>以 <code>Health</code> 为例：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UPROPERTY</span>(ReplicatedUsing = OnRep_Health)</span><br><span class="line"><span class="type">float</span> Health;</span><br></pre></td></tr></table></figure>
+
+<p>服务端修改：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">Health = <span class="number">50.f</span>;</span><br></pre></td></tr></table></figure>
+
+<p>复制时：</p>
+<pre class="mermaid">flowchart TB
+    A["Actor 被判定 relevant"]
+    B["ActorChannel 存在"]
+    C["FObjectReplicator 比较<br/>当前对象数据和 Shadow State"]
+    D["发现 Health 变化"]
+    E["序列化 Health 到 bunch"]
+    F["更新该连接的<br/>发送历史 / shadow"]
+    A --> B --> C --> D --> E --> F</pre>
+
+<p>重点：<strong>属性是否发送是按连接判断的。</strong> 同一个 Actor 的同一个属性，可能发给 A，不发给 B。这取决于：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">Relevancy</span><br><span class="line">Dormancy</span><br><span class="line">Owner</span><br><span class="line">条件复制</span><br><span class="line">NetUpdateFrequency</span><br><span class="line">连接是否饱和</span><br></pre></td></tr></table></figure>
+
+<h3 id="客户端属性接收和-OnRep"><a href="#客户端属性接收和-OnRep" class="headerlink" title="客户端属性接收和 OnRep"></a>客户端属性接收和 OnRep</h3><p>客户端收到属性 bunch：</p>
+<pre class="mermaid">flowchart TB
+    A["UActorChannel 解析 bunch"]
+    B["FObjectReplicator::ReceivedBunch"]
+    C["FRepLayout 反序列化属性"]
+    D["把新值写入对象内存"]
+    E["记录需要触发的 RepNotify"]
+    F["处理 unmapped object references"]
+    G["调用 OnRep 函数"]
+    A --> B --> C --> D --> E --> F --> G</pre>
+
+<p>所以在 <code>OnRep_Health()</code> 中读到的是新值。</p>
+<p>如果需要旧值，可以使用带参数 OnRep：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UPROPERTY</span>(ReplicatedUsing = OnRep_Health)</span><br><span class="line"><span class="type">float</span> Health;</span><br><span class="line"></span><br><span class="line"><span class="built_in">UFUNCTION</span>()</span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">OnRep_Health</span><span class="params">(<span class="type">float</span> OldHealth)</span></span>;</span><br></pre></td></tr></table></figure>
+
+<p>具体支持和签名细节以项目 UE 版本为准。</p>
+<h3 id="服务端不会自动触发-OnRep"><a href="#服务端不会自动触发-OnRep" class="headerlink" title="服务端不会自动触发 OnRep"></a>服务端不会自动触发 OnRep</h3><p>C++ 中服务端修改 RepNotify 属性，不会自动执行客户端式 <code>OnRep</code>。</p>
+<p>推荐：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::SetHealth</span><span class="params">(<span class="type">float</span> NewHealth)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="type">const</span> <span class="type">float</span> OldHealth = Health;</span><br><span class="line">    Health = NewHealth;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (<span class="built_in">HasAuthority</span>())</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="built_in">HandleHealthChanged</span>(OldHealth);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyCharacter::OnRep_Health</span><span class="params">(<span class="type">float</span> OldHealth)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="built_in">HandleHealthChanged</span>(OldHealth);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>把真正逻辑放到 <code>HandleHealthChanged</code>，而不是在服务端硬调 UI 逻辑。</p>
+<hr>
+<h2 id="玩法开发最容易出错清单：逐条举例"><a href="#玩法开发最容易出错清单：逐条举例" class="headerlink" title="玩法开发最容易出错清单：逐条举例"></a>玩法开发最容易出错清单：逐条举例</h2><h3 id="Actor-是否-bReplicates-true"><a href="#Actor-是否-bReplicates-true" class="headerlink" title="Actor 是否 bReplicates = true"></a>Actor 是否 <code>bReplicates = true</code></h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">AChest::<span class="built_in">AChest</span>()</span><br><span class="line">&#123;</span><br><span class="line">    <span class="comment">// 忘了 bReplicates</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>正确：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">AChest::<span class="built_in">AChest</span>()</span><br><span class="line">&#123;</span><br><span class="line">    bReplicates = <span class="literal">true</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="是否由-Server-Spawn"><a href="#是否由-Server-Spawn" class="headerlink" title="是否由 Server Spawn"></a>是否由 Server Spawn</h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="comment">// Client 本地 Spawn</span></span><br><span class="line"><span class="built_in">GetWorld</span>()-&gt;<span class="built_in">SpawnActor</span>&lt;AWeapon&gt;(WeaponClass);</span><br></pre></td></tr></table></figure>
+
+<p>正确：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">Server_RequestEquipWeapon</span>(WeaponId);</span><br></pre></td></tr></table></figure>
+
+<p>服务端：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">AWeapon* Weapon = <span class="built_in">GetWorld</span>()-&gt;<span class="built_in">SpawnActor</span>&lt;AWeapon&gt;(WeaponClass);</span><br><span class="line">Weapon-&gt;<span class="built_in">SetReplicates</span>(<span class="literal">true</span>);</span><br><span class="line">CurrentWeapon = Weapon;</span><br></pre></td></tr></table></figure>
+
+<h3 id="Server-RPC-是否在-Owner-Actor-上调用"><a href="#Server-RPC-是否在-Owner-Actor-上调用" class="headerlink" title="Server RPC 是否在 Owner Actor 上调用"></a>Server RPC 是否在 Owner Actor 上调用</h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">Chest-&gt;<span class="built_in">Server_Open</span>();</span><br></pre></td></tr></table></figure>
+
+<p>如果 <code>Chest</code> 不属于这个客户端，Server RPC 可能被丢弃或不按预期执行。</p>
+<p>正确：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">MyCharacter-&gt;<span class="built_in">Server_RequestOpenChest</span>(Chest);</span><br></pre></td></tr></table></figure>
+
+<p>服务端校验：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="keyword">if</span> (!<span class="built_in">CanInteractWith</span>(Chest))</span><br><span class="line">&#123;</span><br><span class="line">    <span class="keyword">return</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="Client-RPC-是否有正确-Owner"><a href="#Client-RPC-是否有正确-Owner" class="headerlink" title="Client RPC 是否有正确 Owner"></a>Client RPC 是否有正确 Owner</h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">WorldTipActor-&gt;<span class="built_in">Client_ShowTip</span>();</span><br></pre></td></tr></table></figure>
+
+<p>正确：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">PlayerController-&gt;<span class="built_in">Client_ShowTip</span>();</span><br></pre></td></tr></table></figure>
+
+<h3 id="Multicast-是否由-Server-调用"><a href="#Multicast-是否由-Server-调用" class="headerlink" title="Multicast 是否由 Server 调用"></a>Multicast 是否由 Server 调用</h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="comment">// Client 调用</span></span><br><span class="line">Explosion-&gt;<span class="built_in">Multicast_PlayFX</span>();</span><br></pre></td></tr></table></figure>
+
+<p>正确：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">Server_RequestExplode</span>();</span><br><span class="line"></span><br><span class="line"><span class="comment">// Server 内部</span></span><br><span class="line"><span class="built_in">Multicast_PlayFX</span>();</span><br></pre></td></tr></table></figure>
+
+<h3 id="Reliable-是否被高频调用"><a href="#Reliable-是否被高频调用" class="headerlink" title="Reliable 是否被高频调用"></a>Reliable 是否被高频调用</h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">Tick</span><span class="params">(<span class="type">float</span> DeltaSeconds)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="built_in">Server_UpdateAim</span>(AimRot);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>正确：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">压缩 Rotator。</span><br><span class="line">限频 10~20 Hz。</span><br><span class="line">用 Unreliable 或属性同步。</span><br><span class="line">关键开火由 Server 校验。</span><br></pre></td></tr></table></figure>
+
+<h3 id="RPC-参数是否包含不可信数据"><a href="#RPC-参数是否包含不可信数据" class="headerlink" title="RPC 参数是否包含不可信数据"></a>RPC 参数是否包含不可信数据</h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">Server_AddGold</span>(<span class="number">999999</span>);</span><br></pre></td></tr></table></figure>
+
+<p>正确：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">Server_RequestClaimReward</span>(RewardId);</span><br></pre></td></tr></table></figure>
+
+<p>服务端：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="keyword">if</span> (!RewardSystem.<span class="built_in">CanClaim</span>(PlayerState, RewardId))</span><br><span class="line">&#123;</span><br><span class="line">    <span class="keyword">return</span>;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line">RewardSystem.<span class="built_in">Claim</span>(PlayerState, RewardId);</span><br></pre></td></tr></table></figure>
+
+<h3 id="属性是否注册到-GetLifetimeReplicatedProps"><a href="#属性是否注册到-GetLifetimeReplicatedProps" class="headerlink" title="属性是否注册到 GetLifetimeReplicatedProps"></a>属性是否注册到 GetLifetimeReplicatedProps</h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">UPROPERTY</span>(Replicated)</span><br><span class="line">int32 Ammo;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 忘了 DOREPLIFETIME</span></span><br></pre></td></tr></table></figure>
+
+<p>正确：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">AMyWeapon::GetLifetimeReplicatedProps</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">    TArray&lt;FLifetimeProperty&gt;&amp; OutLifetimeProps</span></span></span><br><span class="line"><span class="params"><span class="function">)</span> <span class="type">const</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Super::<span class="built_in">GetLifetimeReplicatedProps</span>(OutLifetimeProps);</span><br><span class="line">    <span class="built_in">DOREPLIFETIME</span>(AMyWeapon, Ammo);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="OnRep-是否-null-safe"><a href="#OnRep-是否-null-safe" class="headerlink" title="OnRep 是否 null-safe"></a>OnRep 是否 null-safe</h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">OnRep_Target</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Target-&gt;<span class="built_in">DoSomething</span>();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>正确：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">OnRep_Target</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (!<span class="built_in">IsValid</span>(Target))</span><br><span class="line">    &#123;</span><br><span class="line">        bPendingBindTarget = <span class="literal">true</span>;</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="built_in">BindTarget</span>();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="OnRep-是否依赖-UI-初始化"><a href="#OnRep-是否依赖-UI-初始化" class="headerlink" title="OnRep 是否依赖 UI 初始化"></a>OnRep 是否依赖 UI 初始化</h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">OnRep_Health</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    HealthBar-&gt;<span class="built_in">SetPercent</span>(Health / MaxHealth);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>正确：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">OnRep_Health</span><span class="params">()</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    OnHealthChanged.<span class="built_in">Broadcast</span>(Health);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>UI 创建后主动拉当前状态：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">HealthBar-&gt;<span class="built_in">SetPercent</span>(Character-&gt;<span class="built_in">GetHealthPercent</span>());</span><br></pre></td></tr></table></figure>
+
+<h3 id="Dormant-时是否先唤醒再改属性"><a href="#Dormant-时是否先唤醒再改属性" class="headerlink" title="Dormant 时是否先唤醒再改属性"></a>Dormant 时是否先唤醒再改属性</h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">SetNetDormancy</span>(DORM_DormantAll);</span><br><span class="line">bIsOpen = <span class="literal">true</span>;</span><br></pre></td></tr></table></figure>
+
+<p>正确：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line"><span class="built_in">FlushNetDormancy</span>();</span><br><span class="line">bIsOpen = <span class="literal">true</span>;</span><br><span class="line"><span class="built_in">ForceNetUpdate</span>();</span><br></pre></td></tr></table></figure>
+
+<h3 id="是否大量-Actor-AlwaysRelevant"><a href="#是否大量-Actor-AlwaysRelevant" class="headerlink" title="是否大量 Actor AlwaysRelevant"></a>是否大量 Actor AlwaysRelevant</h3><p>错误：</p>
+<figure class="highlight cpp"><table><tr><td class="code"><pre><span class="line">bAlwaysRelevant = <span class="literal">true</span>;</span><br></pre></td></tr></table></figure>
+
+<p>然后所有建筑、资源、掉落物都这样写。</p>
+<p>正确：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">全局少量对象 AlwaysRelevant。</span><br><span class="line">空间对象走距离 / ReplicationGraph。</span><br><span class="line">低频对象 Dormancy。</span><br><span class="line">私有对象 OwnerOnly。</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="推荐的网络玩法分层架构"><a href="#推荐的网络玩法分层架构" class="headerlink" title="推荐的网络玩法分层架构"></a>推荐的网络玩法分层架构</h2><h3 id="背包示例"><a href="#背包示例" class="headerlink" title="背包示例"></a>背包示例</h3><pre class="mermaid">sequenceDiagram
+    participant Client
+    participant Server
+    participant Others as 其他客户端
+    Client->>Client: 玩家点击使用物品
+    Client->>Server: Server_UseItem(SlotIndex, ClientPredictedItemId)
+    Note over Server: 校验：Slot 是否存在 / ItemId 匹配<br/>数量足够 / 是否在冷却 / 状态允许
+    alt 校验通过
+        Server->>Server: 修改 Inventory FastArray
+        Server-->>Client: OwnerOnly 同步给自己
+        Server-->>Others: 公开装备变化同步
+        Client->>Client: OnRep / FastArray 刷新成功状态
+    else 校验失败
+        Server-->>Client: Client RPC 返回失败原因
+    end</pre>
+
+<h3 id="建筑示例"><a href="#建筑示例" class="headerlink" title="建筑示例"></a>建筑示例</h3><figure class="highlight text"><table><tr><td class="code"><pre><span class="line">建筑 Actor：</span><br><span class="line">    bReplicates = true</span><br><span class="line">    NetDormancy = DORM_DormantAll</span><br><span class="line">    不 AlwaysRelevant</span><br><span class="line">    走 RepGraph 空间节点</span><br><span class="line"></span><br><span class="line">建筑状态：</span><br><span class="line">    HP</span><br><span class="line">    Level</span><br><span class="line">    OwnerId</span><br><span class="line">    bCompleted</span><br><span class="line">    VisualState</span><br><span class="line"></span><br><span class="line">状态变化：</span><br><span class="line">    FlushNetDormancy</span><br><span class="line">    修改 replicated 属性</span><br><span class="line">    ForceNetUpdate</span><br><span class="line">    必要时重新休眠</span><br></pre></td></tr></table></figure>
+
+<h3 id="UGC-大世界对象示例"><a href="#UGC-大世界对象示例" class="headerlink" title="UGC 大世界对象示例"></a>UGC 大世界对象示例</h3><p>不要每个装饰物都复制 Actor。可以：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">服务端同步 UGC Cell 数据版本。</span><br><span class="line">客户端按 CellId / Seed 本地生成装饰。</span><br><span class="line">只有可交互对象才是 replicated Actor。</span><br><span class="line">大量静态对象使用聚合状态。</span><br><span class="line">变化对象用 FastArray 增量同步。</span><br><span class="line">空间相关对象走 ReplicationGraph。</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="调试与测试建议"><a href="#调试与测试建议" class="headerlink" title="调试与测试建议"></a>调试与测试建议</h2><h3 id="常用命令"><a href="#常用命令" class="headerlink" title="常用命令"></a>常用命令</h3><p>优先使用当前官方网络模拟命令：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">NetEmulation.PktLag 100</span><br><span class="line">NetEmulation.PktLoss 5</span><br><span class="line">NetEmulation.PktDup 2</span><br><span class="line">NetEmulation.PktOrder 1</span><br></pre></td></tr></table></figure>
+
+<p>常用查看：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">stat net</span><br><span class="line">stat netpkt</span><br><span class="line">net.ListActorChannels</span><br><span class="line">net.DumpRelevantActors</span><br><span class="line">net.RPC.Debug 1</span><br><span class="line">net.Reliable.Debug 1</span><br><span class="line">net.ForceOnePacketPerBunch true</span><br><span class="line">net.SubObjects.CompareWithLegacy 1</span><br></pre></td></tr></table></figure>
+
+<p>部分旧命令或 RepGraph 专用命令在不同 UE 版本中可能存在差异，建议在目标版本控制台自动补全或源码中确认。</p>
+<h3 id="推荐测试矩阵"><a href="#推荐测试矩阵" class="headerlink" title="推荐测试矩阵"></a>推荐测试矩阵</h3><figure class="highlight text"><table><tr><td class="code"><pre><span class="line">Dedicated Server + 2 Clients</span><br><span class="line">Listen Server + 1 Client</span><br><span class="line">延迟 100ms</span><br><span class="line">丢包 5%</span><br><span class="line">客户端中途加入</span><br><span class="line">Actor 进入 / 离开 relevancy</span><br><span class="line">Dormant 后唤醒</span><br><span class="line">地图切换</span><br><span class="line">Seamless Travel</span><br><span class="line">重连</span><br><span class="line">大量 Actor 压力测试</span><br></pre></td></tr></table></figure>
+
+<p>不要只在本机 0 延迟 PIE 里测。</p>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>UE 网络同步最容易错的不是 API，而是边界混乱：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">把客户端请求当成权威结果。</span><br><span class="line">把属性同步当成立即调用。</span><br><span class="line">把 RPC 当成全局有序消息。</span><br><span class="line">把 OnRep 当成初始化完成通知。</span><br><span class="line">把 UObject 当成自动可复制对象。</span><br><span class="line">把 Reliable 当成无限可靠队列。</span><br><span class="line">把 PlayerState 公开复制和 OwnerOnly 私有属性混为一谈。</span><br><span class="line">把大量世界对象全部 AlwaysRelevant。</span><br></pre></td></tr></table></figure>
+
+<p>正确做法：</p>
+<figure class="highlight text"><table><tr><td class="code"><pre><span class="line">Client 负责输入、预测、表现。</span><br><span class="line">Server 负责校验、裁决、修改权威状态。</span><br><span class="line">Replicated Property 负责长期状态。</span><br><span class="line">RPC 负责瞬时事件和请求。</span><br><span class="line">FastArray 负责列表增量。</span><br><span class="line">SubObject 负责轻量 UObject 状态。</span><br><span class="line">OwnerOnly 负责私有数据。</span><br><span class="line">ReplicationGraph 负责大规模 Actor 筛选。</span><br><span class="line">Dormancy 负责低频静态对象。</span><br><span class="line">OnRep 只做数据变化响应，不做初始化假设。</span><br></pre></td></tr></table></figure>
+
+<p>最后给一句最适合写进团队 Code Review 的话：</p>
+<blockquote>
+<p>网络玩法不要依赖“某条消息先到”。应该让所有状态最终收敛到服务端权威结果，让所有客户端逻辑在依赖条件满足后再执行。</p>
+</blockquote>
+<hr>
+<h2 id="参考资料"><a href="#参考资料" class="headerlink" title="参考资料"></a>参考资料</h2><ol>
+<li><p>Unreal Engine Documentation - Replicated Object Execution Order<br><a href="https://dev.epicgames.com/documentation/unreal-engine/replicated-object-execution-order-in-unreal-engine">https://dev.epicgames.com/documentation/unreal-engine/replicated-object-execution-order-in-unreal-engine</a></p>
+</li>
+<li><p>Unreal Engine Documentation - Detailed Actor Replication Flow<br><a href="https://dev.epicgames.com/documentation/unreal-engine/detailed-actor-replication-flow-in-unreal-engine">https://dev.epicgames.com/documentation/unreal-engine/detailed-actor-replication-flow-in-unreal-engine</a></p>
+</li>
+<li><p>Unreal Engine Documentation - Remote Procedure Calls<br><a href="https://dev.epicgames.com/documentation/unreal-engine/remote-procedure-calls-in-unreal-engine">https://dev.epicgames.com/documentation/unreal-engine/remote-procedure-calls-in-unreal-engine</a></p>
+</li>
+<li><p>Unreal Engine Documentation - Object Replication &#x2F; Replicating UObjects<br><a href="https://dev.epicgames.com/documentation/unreal-engine/replicating-uobjects-in-unreal-engine">https://dev.epicgames.com/documentation/unreal-engine/replicating-uobjects-in-unreal-engine</a></p>
+</li>
+<li><p>Unreal Engine Documentation - Replicating Object References<br><a href="https://dev.epicgames.com/documentation/unreal-engine/replicating-object-references-in-unreal-engine">https://dev.epicgames.com/documentation/unreal-engine/replicating-object-references-in-unreal-engine</a></p>
+</li>
+<li><p>Unreal Engine API - FFastArraySerializer<br><a href="https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/NetCore/FFastArraySerializer">https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/NetCore/FFastArraySerializer</a></p>
+</li>
+<li><p>Unreal Engine Documentation - Replication Graph<br><a href="https://dev.epicgames.com/documentation/unreal-engine/replication-graph-in-unreal-engine">https://dev.epicgames.com/documentation/unreal-engine/replication-graph-in-unreal-engine</a></p>
+</li>
+<li><p>Unreal Engine Documentation - Actor Network Dormancy<br><a href="https://dev.epicgames.com/documentation/unreal-engine/actor-network-dormancy-in-unreal-engine">https://dev.epicgames.com/documentation/unreal-engine/actor-network-dormancy-in-unreal-engine</a></p>
+</li>
+<li><p>Unreal Engine Documentation - Actor Relevancy<br><a href="https://dev.epicgames.com/documentation/unreal-engine/actor-relevancy-in-unreal-engine">https://dev.epicgames.com/documentation/unreal-engine/actor-relevancy-in-unreal-engine</a></p>
+</li>
+<li><p>Unreal Engine Documentation - Console Commands for Network Debugging<br><a href="https://dev.epicgames.com/documentation/unreal-engine/console-commands-for-network-debugging-in-unreal-engine">https://dev.epicgames.com/documentation/unreal-engine/console-commands-for-network-debugging-in-unreal-engine</a></p>
+</li>
+</ol>
+]]></content>
+      <categories>
+        <category>Unreal Engine</category>
+        <category>网络同步</category>
+      </categories>
+      <tags>
+        <tag>Unreal Engine</tag>
+        <tag>UE 网络同步</tag>
+        <tag>Replication</tag>
+        <tag>RPC</tag>
+        <tag>ReplicationGraph</tag>
+        <tag>FastArray</tag>
+      </tags>
+  </entry>
+</search>
